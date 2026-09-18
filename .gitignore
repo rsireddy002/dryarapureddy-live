@@ -1,0 +1,14 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+.env
+*.env
+fno_live_candles.json
+fno_live_candles.json.tmp
+paper_trades.json
+sahi_zones_cache.json
+fno_universe_cache.json
+instrument_keys_cache.json
+.DS_Store
+.vscode/
+.idea/

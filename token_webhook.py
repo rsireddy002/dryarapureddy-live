@@ -30,7 +30,11 @@ SECURITY NOTE -- READ THIS:
 
 SETUP:
     pip install flask
-    Set EXPECTED_CLIENT_ID below to your actual API key.
+    Set both of these env vars before running (neither is hardcoded here
+    on purpose -- WEBHOOK_PATH in particular IS this endpoint's only
+    security, per the note above, so it must never be committed/shared):
+        $env:UPSTOX_WEBHOOK_PATH = "/upstox-webhook-<your-own-long-random-string>"
+        $env:UPSTOX_API_KEY = "your_app's_api_key"
     python token_webhook.py
     (Runs on plain HTTP on port 5001 -- nginx handles the real HTTPS
     termination in front of this, see the nginx setup instructions
@@ -43,11 +47,22 @@ import time
 
 from flask import Flask, request, jsonify
 
-# Change this to something long and unguessable -- this IS the
-# "security" for this endpoint, per the module docstring's security note.
-WEBHOOK_PATH = "/upstox-webhook-8f3e9a2c1b7d4f6e"
+# Long/random and NEVER hardcoded/committed -- this IS the "security" for
+# this endpoint, per the module docstring's security note above. Must be
+# set via env var before running; there's deliberately no fallback value.
+WEBHOOK_PATH = os.environ.get("UPSTOX_WEBHOOK_PATH")
+if not WEBHOOK_PATH:
+    raise RuntimeError(
+        "UPSTOX_WEBHOOK_PATH not set -- pick your own long/random path "
+        "(e.g. '/upstox-webhook-' + 32 random hex chars) and set it as an "
+        "env var. Never hardcode or commit this value -- it's the only "
+        "thing keeping this endpoint from being guessable, per the "
+        "security note above."
+    )
 
-EXPECTED_CLIENT_ID = "b0576872-1a64-4e0c-b315-e7b87793a188"  # your "Claude" app's API key
+EXPECTED_CLIENT_ID = os.environ.get("UPSTOX_API_KEY")  # your app's API key
+if not EXPECTED_CLIENT_ID:
+    raise RuntimeError("UPSTOX_API_KEY not set.")
 
 # EnvironmentFile= format: KEY=VALUE lines, no quotes, no spaces around =.
 # systemd re-reads this file every time a unit using it is (re)started --

@@ -26,7 +26,9 @@ import sys
 
 import requests
 
-API_KEY = os.environ.get("UPSTOX_API_KEY", "b0576872-1a64-4e0c-b315-e7b87793a188")
+API_KEY = os.environ.get("UPSTOX_API_KEY")  # no hardcoded fallback -- set this env var
+if not API_KEY:
+    raise RuntimeError("UPSTOX_API_KEY not set.")
 API_SECRET = os.environ.get("UPSTOX_API_SECRET")  # set this each time you run, don't hardcode
 
 TRIGGER_URL_TEMPLATE = "https://api.upstox.com/v2/login/auth/token/request/{client_id}"
