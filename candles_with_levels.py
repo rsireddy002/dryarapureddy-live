@@ -463,6 +463,41 @@ def compute_cumulative_volume_delta(df):
     return pd.Series(delta, index=df.index).cumsum()
 
 
+def compute_recent_order_flow_imbalance_pct(df, lookback=6):
+    """Normalized order-flow confirmation over the last `lookback` candles:
+    (sum of signed volume-delta) / (sum of raw volume) * 100 -- reads as
+    a %-of-recent-volume net buying (positive) or net selling (negative)
+    pressure.
+
+    This is deliberately a DIFFERENT shape of number than
+    compute_cumulative_volume_delta's running total: the cumulative sum
+    scales with however much volume a stock has traded since the open
+    (a high-volume large-cap's cumulative CVD dwarfs a lower-volume
+    stock's, even with identical recent buying pressure), so it isn't
+    comparable zone-to-zone or symbol-to-symbol. Normalizing by recent
+    volume makes it directly comparable across stocks and directly
+    usable as one input into a weighted composite score (see
+    zone_validation.compute_cvd_zone_signal), the same way RVOL% already
+    normalizes volume itself for cross-symbol comparison elsewhere in
+    this app.
+
+    Uses the SAME up/down-close approximation as
+    compute_cumulative_volume_delta (see its docstring for the
+    tick-data caveat -- this is not true bid/ask order flow).
+
+    Returns None if there isn't enough data or the recent window has
+    zero volume (can't normalize by zero)."""
+    if df is None or df.empty or len(df) < 2:
+        return None
+    recent = df.tail(min(lookback, len(df)))
+    total_vol = recent["volume"].sum()
+    if total_vol <= 0:
+        return None
+    delta = np.where(recent["close"] > recent["open"], recent["volume"],
+                      np.where(recent["close"] < recent["open"], -recent["volume"], 0))
+    return float(delta.sum() / total_vol * 100)
+
+
 def build_cvd_chart(df, height=100, compact=False, x_range=None):
     """A small bar chart of cumulative volume delta, meant to sit
     directly below a price chart from plot_candles_with_zones -- same
