@@ -5,15 +5,18 @@ hitting Upstox's REST historical-candle endpoint.
 
 RECONSTRUCTED, not an original vendored file (it wasn't part of what was
 uploaded) -- written straight from README_fno_websocket_feed.md's
-documented output format:
+documented output format, since updated to a per-interval nested shape
+when feed_listener.py started aggregating 1m/5m/15m candles from the same
+tick stream at once (previously 5-min bars only):
 
     {
-      "RELIANCE": [
-        {"timestamp": "2026-09-05T09:15:00+05:30", "open":, "high":,
-         "low":, "close":, "volume":},
-        ...
-      ],
-      "NIFTY": [...],
+      "RELIANCE": {
+        "1": [{"timestamp": "2026-09-05T09:15:00+05:30", "open":,
+                "high":, "low":, "close":, "volume":}, ...],
+        "5": [...],
+        "15": [...]
+      },
+      "NIFTY": {...},
       ...
     }
 
@@ -25,11 +28,12 @@ in THIS folder is currently dumping, not the other pipeline's database.
 Nothing in the existing upstox-live-feed/viewer.py setup is touched by
 this file.
 
-app.py's get_today_candles() calls get_live_candles(symbol) with no other
-args and treats an empty DataFrame as "the live feed doesn't have this
-symbol (yet)" -- falling back to its own REST fetch in that case. So this
-reader is deliberately forgiving: a missing/stale/malformed file, or a
-symbol not yet present, all just return an empty DataFrame rather than
+app.py's get_today_candles()/get_today_candles_for_interval() call
+get_live_candles(symbol, interval=...) and treat an empty DataFrame as
+"the live feed doesn't have this symbol/interval (yet)" -- falling back
+to REST in that case. So this reader is deliberately forgiving: a
+missing/stale/malformed file, an interval the feed doesn't aggregate, or
+a symbol not yet present, all just return an empty DataFrame rather than
 raising.
 """
 import json
@@ -65,18 +69,22 @@ def _load_raw():
         return None
 
 
-def get_live_candles(symbol: str) -> pd.DataFrame:
-    """Returns today's rolling 5-min candles for `symbol` from the live
-    WebSocket feed's snapshot file, oldest first. Columns: timestamp
-    (tz-aware), open, high, low, close, volume. Empty DataFrame if the
-    feed isn't running, the file is stale, or this symbol has no bars
-    yet -- callers (see app.py's get_today_candles) treat that as "fall
-    back to REST", not an error."""
+def get_live_candles(symbol: str, interval: str = "5") -> pd.DataFrame:
+    """Returns today's rolling candles for `symbol` at the given interval
+    ("1"/"5"/"15", matching candle_aggregator.INTERVALS_SECONDS -- default
+    "5" for backward compatibility with the original 5-min-only feed) from
+    the live WebSocket feed's snapshot file, oldest first. Columns:
+    timestamp (tz-aware), open, high, low, close, volume. Empty DataFrame
+    if the feed isn't running, the file is stale, this symbol has no bars
+    yet, or the feed doesn't aggregate this interval -- callers (see
+    app.py's get_today_candles/get_today_candles_for_interval) treat that
+    as "fall back to REST", not an error."""
     raw = _load_raw()
     if not raw:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-    bars = raw.get(symbol.strip().upper()) or raw.get(symbol)
+    by_symbol = raw.get(symbol.strip().upper()) or raw.get(symbol) or {}
+    bars = by_symbol.get(interval)
     if not bars:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 

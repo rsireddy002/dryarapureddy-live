@@ -33,8 +33,15 @@ SETUP:
 
 OUTPUT:
     fno_live_candles.json -- updated every DUMP_INTERVAL_SECONDS, holding
-    {symbol: [{"timestamp": iso, "open":, "high":, "low":, "close":, "volume":}, ...]}
-    for every symbol currently subscribed.
+    {symbol: {interval: [{"timestamp": iso, "open":, "high":, "low":,
+                           "close":, "volume":}, ...]}}
+    for every symbol currently subscribed, where interval is "1"/"5"/"15"
+    (see candle_aggregator.INTERVALS_SECONDS) -- built from the SAME tick
+    stream at three granularities at once, so app.py's Dashboard interval
+    switcher can read live candles at any of the three, not just 5-min.
+    (Format changed from a flat {symbol: [bars...]} list to this nested
+    dict when 1m/15m aggregation was added -- restarting this script
+    overwrites the old-format file within one DUMP_INTERVAL_SECONDS.)
 
     paper_trades.json -- updated in real time by tick_paper_trader.py
     whenever a paper trade opens or closes.
@@ -48,7 +55,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 import websocket  # pip install websocket-client
 
-from candle_aggregator import CandleAggregator
+from candle_aggregator import CandleAggregator, INTERVALS_SECONDS
 from instrument_resolver import resolve_all, get_token
 from proto_decoder import decode_feed_message
 import tick_paper_trader
@@ -70,7 +77,8 @@ TIER1_SYMBOLS = ["NIFTY", "BANKNIFTY"]
 TIER1_MODE = "full_d30"
 TIER2_MODE = "full"
 
-aggregator = CandleAggregator()
+aggregator = CandleAggregator(bar_seconds_list=list(INTERVALS_SECONDS.values()))
+SECONDS_TO_LABEL = {v: k for k, v in INTERVALS_SECONDS.items()}
 symbol_by_key = {}  # instrument_key -> symbol, built from instrument_resolver's output
 _stop_event = threading.Event()
 
@@ -100,13 +108,20 @@ def dump_loop():
     second timer thread just for that."""
     tmp_path = OUTPUT_PATH + ".tmp"
     while not _stop_event.is_set():
+        # snapshot() returns {symbol: {bar_seconds: [bars...]}} -- translate
+        # the bar_seconds keys to the "1"/"5"/"15" labels app.py's
+        # live_feed_reader.py looks up by, and ISO-format each bar's
+        # timestamp for JSON.
         snapshot = aggregator.snapshot()
         serializable = {
-            sym: [
-                {**bar, "timestamp": bar["timestamp"].isoformat()}
-                for bar in bars
-            ]
-            for sym, bars in snapshot.items()
+            sym: {
+                SECONDS_TO_LABEL[bar_seconds]: [
+                    {**bar, "timestamp": bar["timestamp"].isoformat()}
+                    for bar in bars
+                ]
+                for bar_seconds, bars in by_interval.items()
+            }
+            for sym, by_interval in snapshot.items()
         }
         with open(tmp_path, "w") as f:
             json.dump(serializable, f)

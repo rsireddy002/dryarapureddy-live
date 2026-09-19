@@ -1,5 +1,5 @@
 """
-app.py - Sahi Key Levels LIVE (cross-timeframe validated zones + alerts)
+app.py - Dr Yarapu Reddy Levels (cross-timeframe validated zones + alerts)
 
 Builds on the sahi-key-levels module (vendored below, UNCHANGED) to add:
   1. Two independently-computed zone sets per symbol: a COMPOSITE profile
@@ -47,9 +47,11 @@ SETUP:
 import os
 import re
 import json
+import socket
 import time
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone, time as dtime
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -60,10 +62,32 @@ from streamlit_autorefresh import st_autorefresh
 
 from hvn_lvn import build_volume_profile, find_hvn_lvn
 from sahi_style_key_levels import sahi_style_key_levels
-from zone_validation import cross_validated_zones, compute_zone_signal
-from candles_with_levels import plot_candles_with_zones, build_cvd_chart, compute_cumulative_volume_delta
+from zone_validation import cross_validated_zones, compute_zone_signal, compute_cvd_zone_signal
+from candles_with_levels import (
+    plot_candles_with_zones, build_cvd_chart, compute_cumulative_volume_delta,
+    compute_recent_order_flow_imbalance_pct,
+)
 from ml_predict import predict_break_probability
 from live_feed_reader import get_live_candles
+from candle_aggregator import INTERVALS_SECONDS  # which intervals the live feed can serve ("1"/"5"/"15")
+
+# Force IPv4 for every outbound connection this process makes. Confirmed
+# necessary via a real debugging session: this app's network silently
+# prefers IPv6 by default, which routes outbound requests from an address
+# Upstox's static-IP allowlist doesn't recognize (Upstox's restriction is
+# IPv4-only) -- Upstox's own error body (UDAPI1154) named the exact
+# mismatched IPv6 address when this was diagnosed via place_real_order.py
+# and feed_listener.py. Applied globally here (not just around the real-
+# order call below) since it's a no-op on an IPv4-only network and every
+# Upstox API call in this app benefits from it, not just order placement.
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _getaddrinfo_ipv4_only
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -81,9 +105,24 @@ def current_candle_boundary_key(now_dt):
     boundary = now_dt.replace(minute=floored_minute, second=0, microsecond=0)
     return boundary.strftime("%Y-%m-%d %H:%M")
 
+
+def seconds_to_next_candle_close(now_dt, interval_minutes):
+    """Seconds remaining until the current interval_minutes-candle closes
+    -- feeds the Dashboard tab's 'Current candle closes in' readout.
+    Parameterized by interval_minutes (unlike current_candle_boundary_key
+    above, which is hardcoded to CANDLE_INTERVAL_MINUTES for the scan
+    cadence) so it works for whichever interval the Dashboard's switcher
+    currently has selected."""
+    floored_minute = (now_dt.minute // interval_minutes) * interval_minutes
+    boundary = now_dt.replace(minute=floored_minute, second=0, microsecond=0)
+    next_close = boundary + timedelta(minutes=interval_minutes)
+    return max(0, int((next_close - now_dt).total_seconds()))
+
 # ---------------- Config ----------------
 INSTRUMENT_SEARCH_URL = "https://api.upstox.com/v2/instruments/search"
 QUOTES_URL = "https://api.upstox.com/v2/market-quote/quotes"
+UPSTOX_AUTHORIZE_URL = "https://api.upstox.com/v2/login/authorization/dialog"
+UPSTOX_TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token"
 CACHE_PATH = "sahi_zones_cache.json"
 ALERT_LOG_PATH = "alert_log.json"
 FNO_LIVE_CANDLES_PATH = os.environ.get("FNO_LIVE_CANDLES_PATH", "fno_live_candles.json")
@@ -128,12 +167,30 @@ NEAR_ZONE_PCT = 0.3   # how close (%) LTP must be to a validated zone edge to co
 PREMIUM_MIN_ZONE_PCT = 20.0     # zone's share of session volume must be at least this high
 PREMIUM_MAX_ML_RISK_PCT = 15.0  # ML-predicted break probability must be below this
 
+CVD_QUALITY_LOOKBACK_CANDLES = 6  # recent-candle window for compute_recent_order_flow_imbalance_pct
+
 # --- Paper trading (SIMULATED, no real orders) ---
 PAPER_TRADE_LOG_PATH = "paper_trades.json"
 HEARTBEAT_PATH = "daemon_heartbeat.json"
 PAPER_TRADE_SIZE_RUPEES = 25000   # fixed rupee amount per simulated trade
 PAPER_TRADE_ML_RISK_THRESHOLD = 15.0  # entry only if the crossed level's ML break-risk is BELOW this %
 PAPER_TRADE_UNIVERSE_TOP_N = 10  # only the top-N Wide Range stocks (widest support-resistance gap) are eligible for entries
+
+# --- Real order placement (REAL MONEY, Dashboard tab's "Real" trade mode
+# only -- everywhere else in this app stays simulated). Same endpoint/
+# payload shape proven working by the standalone place_real_order.py
+# diagnostic script earlier in this project (api-hft.upstox.com is
+# Upstox's dedicated low-latency order endpoint, separate from
+# api.upstox.com which the rest of this app uses for quotes/candles). ---
+REAL_ORDER_URL = "https://api-hft.upstox.com/v3/order/place"
+REAL_ORDER_LOG_PATH = "real_orders_log.json"
+# Saved once a login exchange succeeds, so API Key/Secret/Redirect URI
+# don't need retyping into the sidebar on every restart -- same
+# "typed once, persisted to disk, gitignored" pattern as
+# upstox_token.txt for the token itself. Not committed (see .gitignore);
+# the secret is stored in plaintext here, which is the same trust level
+# this app already applies to the access token it saves the same way.
+UPSTOX_OAUTH_CONFIG_PATH = "upstox_oauth_config.json"
 
 # Full liquid NSE F&O universe (not restricted to Nifty 50 anymore) --
 # same universe proven out across the other repos (hvn-lvn-scanner,
@@ -360,7 +417,83 @@ def get_token():
     )
 
 
+def build_upstox_login_url(api_key, redirect_uri):
+    """The URL to send the user to in a browser to approve this app --
+    step 1 of Upstox's OAuth authorization-code flow. Upstox redirects
+    back to redirect_uri with ?code=... in the query string once
+    approved (the redirect_uri itself doesn't need to resolve to
+    anything real -- the code just needs to be visible in the browser's
+    address bar to copy back out)."""
+    return (
+        f"{UPSTOX_AUTHORIZE_URL}?response_type=code&client_id={quote(api_key, safe='')}"
+        f"&redirect_uri={quote(redirect_uri, safe='')}"
+    )
+
+
+def exchange_upstox_auth_code(auth_code, api_key, api_secret, redirect_uri):
+    """Step 2: trades the short-lived authorization code for a real
+    access_token. This is the ONLY thing that determines what
+    permissions the resulting token carries -- whatever this app's
+    trading/market-data scopes are set to in the Upstox developer
+    console, a token minted this way inherits them, unlike a token
+    grabbed some other way that may turn out read-only (UDAPI100067).
+    Returns (ok, message_or_token_dict)."""
+    try:
+        resp = requests.post(
+            UPSTOX_TOKEN_URL,
+            headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "code": auth_code.strip(),
+                "client_id": api_key.strip(),
+                "client_secret": api_secret.strip(),
+                "redirect_uri": redirect_uri.strip(),
+                "grant_type": "authorization_code",
+            },
+            timeout=20,
+        )
+    except requests.exceptions.RequestException as e:
+        return False, f"Request failed before reaching Upstox: {e}"
+    try:
+        body = resp.json()
+    except Exception:
+        return False, f"Non-JSON response (HTTP {resp.status_code}): {resp.text[:300]}"
+    if resp.status_code >= 400:
+        return False, f"Rejected by Upstox (HTTP {resp.status_code}): {body}"
+    if not body.get("access_token"):
+        return False, f"No access_token in response: {body}"
+    return True, body
+
+
+def load_saved_oauth_config():
+    """Whatever API Key/Secret/Redirect URI last worked, if anything --
+    read once per script run to prefill the sidebar's login fields so
+    they don't need retyping every restart. Missing/corrupt file just
+    means "nothing saved yet", not an error."""
+    if os.path.exists(UPSTOX_OAUTH_CONFIG_PATH):
+        try:
+            with open(UPSTOX_OAUTH_CONFIG_PATH, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_oauth_config(api_key, api_secret, redirect_uri):
+    """Called only right after a login exchange actually succeeds --
+    saving credentials that just proved they work, not whatever's
+    sitting in the form. Best-effort: a write failure here shouldn't
+    break the login that already succeeded."""
+    try:
+        with open(UPSTOX_OAUTH_CONFIG_PATH, "w") as f:
+            json.dump({"api_key": api_key, "api_secret": api_secret, "redirect_uri": redirect_uri}, f)
+    except OSError:
+        pass
+
+
 def resolve_equity_instrument_key(symbol, token):
+    """Returns (instrument_key, lot_size) -- lot_size is always 1 for
+    equities (quantity there just means share count), returned anyway so
+    callers can treat equities and futures uniformly."""
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     params = {"query": symbol, "exchanges": "NSE", "segments": "EQ",
               "instrument_types": "EQ", "page_number": 1, "records": 10}
@@ -368,14 +501,19 @@ def resolve_equity_instrument_key(symbol, token):
     resp.raise_for_status()
     candidates = [inst for inst in resp.json().get("data", [])
                   if inst.get("trading_symbol", "").upper() == symbol.upper()]
-    return candidates[0]["instrument_key"] if candidates else None
+    return (candidates[0]["instrument_key"], 1) if candidates else (None, None)
 
 
 def resolve_futures_instrument_key(name, token):
     """No expiry filter - sorts client-side by expiry (same fix already
     applied in hvn-lvn-scanner: 'current_month' keyword returns zero
     results once that month's contract expires but the calendar hasn't
-    rolled over yet)."""
+    rolled over yet).
+
+    Returns (instrument_key, lot_size). lot_size is read live from
+    Upstox's own instrument-search response (never hardcoded) since NSE
+    periodically revises F&O lot sizes -- a stale hardcoded value would
+    silently produce a wrong-sized real order once a revision happens."""
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     params = {"query": name, "exchanges": "NSE", "segments": "FO",
               "instrument_types": "FUT", "page_number": 1, "records": 30}
@@ -385,9 +523,62 @@ def resolve_futures_instrument_key(name, token):
                   if inst.get("instrument_type") == "FUT"
                   and inst.get("underlying_symbol", "").upper() == name.upper()]
     if not candidates:
-        return None
+        return None, None
     candidates.sort(key=lambda x: x["expiry"])
-    return candidates[0]["instrument_key"]
+    nearest = candidates[0]
+    lot_size = nearest.get("lot_size")
+    return nearest["instrument_key"], (int(lot_size) if lot_size else None)
+
+
+def resolve_commodity_instrument_key(name, token):
+    """Nearest-expiry lookup for a commodity future, same pattern as
+    resolve_futures_instrument_key. Returns (instrument_key, lot_size,
+    exchange) -- the exchange string is included so the caller can show
+    it for a human sanity check before ever placing a real order, and
+    because it's the crux of a real live issue (see below).
+
+    MCX orders are, as of testing, TEMPORARILY DISABLED platform-wide by
+    Upstox itself (order placement returns UDAPI1161: "MCX API orders
+    are temporarily disabled. Meanwhile, place commodity orders on NSE
+    (NSCOM).") -- straight from Upstox, not this app. So this tries
+    exchanges="NSCOM" first (the exact name Upstox's own error message
+    uses), then falls back to exchanges="NSE" with a commodity segment
+    filter if "NSCOM" isn't accepted as a query value (Upstox's public
+    docs are inconsistent about which one the Instrument Search API
+    itself expects). Either way, any candidate actually on MCX is
+    filtered out here, since that's the exchange that's broken right
+    now -- don't resolve to an instrument that's guaranteed to be
+    rejected again.
+
+    IMPORTANT -- do NOT reuse the F&O quantity math with this lot_size.
+    Per Upstox's own Place Order API docs, the `quantity` field means
+    something different by segment: for F&O/equities it's a unit count
+    (must be a multiple of lot_size), but for commodities it's already
+    the NUMBER OF LOTS -- lot_size here is informational only. Upstox's
+    own developer forum has a report of this exact field's behavior
+    being inconsistent in production, so treat lot_size from this
+    function as "for display", not as a multiplier."""
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+
+    def _search(exchanges):
+        params = {"query": name, "exchanges": exchanges, "segments": "COMM",
+                  "instrument_types": "FUT", "page_number": 1, "records": 30}
+        resp = requests.get(INSTRUMENT_SEARCH_URL, headers=headers, params=params, timeout=20)
+        if resp.status_code >= 400:
+            return []
+        return resp.json().get("data", [])
+
+    data = _search("NSCOM") or _search("NSE")
+    candidates = [inst for inst in data
+                  if inst.get("instrument_type") == "FUT"
+                  and inst.get("underlying_symbol", "").upper() == name.upper()
+                  and inst.get("exchange", "").upper() != "MCX"]
+    if not candidates:
+        return None, None, None
+    candidates.sort(key=lambda x: x["expiry"])
+    nearest = candidates[0]
+    lot_size = nearest.get("lot_size")
+    return nearest["instrument_key"], (int(lot_size) if lot_size else None), nearest.get("exchange")
 
 
 def fetch_candles(instrument_key, token, unit, interval, lookback_days):
@@ -557,11 +748,13 @@ def fetch_intraday_candles(instrument_key, token, unit="minutes", interval="5"):
     return df
 
 
-def fetch_today_candles(instrument_key, token):
-    """Today's session candles via the intraday endpoint. Falls back to
-    the historical endpoint's last available day (e.g. before market
-    open, when the intraday endpoint may return nothing yet) so the
-    Chart/zone functions always get something to work with.
+def fetch_today_candles_for(instrument_key, token, unit="minutes", interval="5"):
+    """Generalized version of fetch_today_candles, parameterized by
+    unit/interval -- today's session candles via the intraday endpoint,
+    falling back to the historical endpoint's last available day (e.g.
+    before market open, when the intraday endpoint may return nothing
+    yet) so the Chart/zone/Dashboard functions always get something to
+    work with.
 
     The fallback call is wrapped defensively (unlike fetch_candles'
     other call site inside run_precompute, which already has its own
@@ -571,18 +764,27 @@ def fetch_today_candles(instrument_key, token):
     symbol's request failing (e.g. a 400 from asking the historical
     endpoint for a still-open trading day, which it doesn't support)
     must not crash the whole page."""
-    df = fetch_intraday_candles(instrument_key, token, "minutes", "5")
+    df = fetch_intraday_candles(instrument_key, token, unit, interval)
     if not df.empty:
         return df
 
     try:
-        df = fetch_candles(instrument_key, token, "minutes", "5", lookback_days=1)
+        df = fetch_candles(instrument_key, token, unit, interval, lookback_days=1)
     except requests.exceptions.RequestException:
         return pd.DataFrame()
     if df.empty:
         return df
     latest = df["date"].max()
     return df[df["date"] == latest]
+
+
+def fetch_today_candles(instrument_key, token):
+    """5-min convenience wrapper around fetch_today_candles_for -- every
+    OTHER call site in this app (Chart/Sectors/Zone Watch/etc.) wants the
+    standard CANDLE_INTERVAL_MINUTES granularity, so they keep calling
+    this unchanged. Only the Dashboard tab's interval switcher calls
+    fetch_today_candles_for directly with a different interval."""
+    return fetch_today_candles_for(instrument_key, token, "minutes", "5")
 
 
 @st.cache_data(ttl=45, show_spinner=False)
@@ -596,6 +798,15 @@ def fetch_today_candles_cached(instrument_key, token):
     return fetch_today_candles(instrument_key, token)
 
 
+@st.cache_data(ttl=45, show_spinner=False)
+def fetch_today_candles_interval_cached(instrument_key, token, unit, interval):
+    """Same 45s memoization as fetch_today_candles_cached, but for an
+    arbitrary unit/interval -- backs the Dashboard tab's 1m/5m/15m
+    switcher so flipping intervals (or an auto-refresh tick) doesn't
+    re-hit the API more than once every 45s per (symbol, interval)."""
+    return fetch_today_candles_for(instrument_key, token, unit, interval)
+
+
 def get_today_candles(symbol, instrument_key, token):
     """Tries the live WebSocket feed first (fno-websocket-feed's shared
     JSON file) -- instant, no API call, genuinely live. Falls back to the
@@ -604,10 +815,26 @@ def get_today_candles(symbol, instrument_key, token):
     the listener only just started). This fallback is what keeps
     Streamlit Cloud working exactly as before -- the live feed file will
     simply never exist there, so every call just uses REST, unchanged."""
-    live_df = get_live_candles(symbol)
+    live_df = get_live_candles(symbol, interval=str(CANDLE_INTERVAL_MINUTES))
     if live_df is not None and not live_df.empty:
         return live_df
     return fetch_today_candles_cached(instrument_key, token)
+
+
+def get_today_candles_for_interval(symbol, instrument_key, token, unit, interval):
+    """Same live-feed-first / REST-fallback preference as
+    get_today_candles, but for an arbitrary unit/interval -- used by the
+    Dashboard tab's interval switcher. The live WebSocket feed aggregates
+    every interval in candle_aggregator.INTERVALS_SECONDS ("1"/"5"/"15")
+    from the same tick stream at once, so all three are live-feed-first
+    now, not just the CANDLE_INTERVAL_MINUTES default; anything else
+    (a unit other than minutes, or an interval the feed doesn't build)
+    goes straight to the interval-aware REST path."""
+    if unit == "minutes" and interval in INTERVALS_SECONDS:
+        live_df = get_live_candles(symbol, interval=interval)
+        if live_df is not None and not live_df.empty:
+            return live_df
+    return fetch_today_candles_interval_cached(instrument_key, token, unit, interval)
 
 
 def run_precompute(token, progress_callback=None):
@@ -615,8 +842,8 @@ def run_precompute(token, progress_callback=None):
     all_symbols = [(s, "equity") for s in EQUITY_SYMBOLS] + [(s, "futures") for s in FUTURES_SYMBOLS]
     for i, (symbol, kind) in enumerate(all_symbols):
         try:
-            key = (resolve_equity_instrument_key(symbol, token) if kind == "equity"
-                   else resolve_futures_instrument_key(symbol, token))
+            key, lot_size = (resolve_equity_instrument_key(symbol, token) if kind == "equity"
+                              else resolve_futures_instrument_key(symbol, token))
             if key is None:
                 continue
             daily_df = fetch_candles(key, token, "days", "1", DAILY_LOOKBACK_DAYS)
@@ -631,6 +858,7 @@ def run_precompute(token, progress_callback=None):
 
             cache[symbol] = {
                 "instrument_key": key,
+                "lot_size": lot_size,
                 "prev_close": prev_close,
                 "avg_daily_volume": avg_daily_volume,
                 "composite_zones": composite_zones,
@@ -911,6 +1139,79 @@ def open_paper_trade(paper_log, candidate):
         "exit_reason": None, "pnl": None,
     })
     return True
+
+
+def place_real_market_order(instrument_key, quantity, transaction_type, token, tag="dashboard", product="I"):
+    """Places a REAL MARKET order via Upstox's order-placement API --
+    REAL MONEY, not a simulation. Same payload shape and endpoint as the
+    proven-working place_real_order.py diagnostic script (product "I" =
+    intraday/MIS by default, price 0 as required for MARKET orders).
+    Only the Dashboard tab's explicit "Real" trade mode calls this --
+    every other trade path in this app (algo entries, manual Buy/Sell
+    elsewhere, tick_paper_trader.py) stays simulated via open_paper_trade
+    above.
+
+    product: "I" (intraday/MIS) for the F&O trade section's default.
+    Some scrips reject intraday outright with UDAPI100500 "Intraday (I)
+    orders are not allowed on this scrip" -- confirmed live for the
+    NSE-commodity CRUDEOIL contract, and Upstox's own community forum's
+    standard advice for this exact error, across scrips generally, is
+    "place a delivery order instead" -- i.e. product="D". The commodity
+    test section passes "D" for that reason; the F&O section keeps "I".
+
+    Returns (success: bool, message: str, order_ids: list). Never raises
+    on an HTTP-level rejection (bad margin, market closed, etc) -- that
+    comes back as success=False with Upstox's own error message, same as
+    a network failure would, so the caller can show either one the same
+    way without a bare exception surfacing in the UI."""
+    payload = {
+        "quantity": quantity, "product": product, "validity": "DAY", "price": 0,
+        "tag": tag, "instrument_token": instrument_key, "order_type": "MARKET",
+        "transaction_type": transaction_type, "disclosed_quantity": 0,
+        "trigger_price": 0, "is_amo": False,
+    }
+    headers = {
+        "Content-Type": "application/json", "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    try:
+        resp = requests.post(REAL_ORDER_URL, json=payload, headers=headers, timeout=20)
+    except requests.exceptions.RequestException as e:
+        return False, f"Request failed before reaching Upstox: {e}", []
+
+    try:
+        body = resp.json()
+    except Exception:
+        return False, f"Non-JSON response (HTTP {resp.status_code}): {resp.text[:300]}", []
+
+    if resp.status_code >= 400:
+        return False, f"Rejected by Upstox (HTTP {resp.status_code}): {body}", []
+
+    order_ids = body.get("data", {}).get("order_ids", [])
+    return True, f"Order placed. Order ID(s): {order_ids}", order_ids
+
+
+def load_real_orders_log():
+    if os.path.exists(REAL_ORDER_LOG_PATH):
+        with open(REAL_ORDER_LOG_PATH, "r") as f:
+            return json.load(f)
+    return {"orders": []}
+
+
+def log_real_order(symbol, transaction_type, quantity, order_ids, instrument_key):
+    """Append-only local record of every real order this app has placed
+    -- Upstox's own Orders console is the actual source of truth, this
+    is just so you have a record inside the app too without needing to
+    cross-reference the console after the fact. Never used to decide
+    anything (no dedup/exit logic reads this), purely informational."""
+    log = load_real_orders_log()
+    log["orders"].append({
+        "symbol": symbol, "transaction_type": transaction_type, "quantity": quantity,
+        "order_ids": order_ids, "instrument_key": instrument_key,
+        "time": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    with open(REAL_ORDER_LOG_PATH, "w") as f:
+        json.dump(log, f, indent=2)
 
 
 def check_paper_trade_exits(paper_log, price_lookup, force_eod=False):
@@ -1340,7 +1641,36 @@ def run_live_scan(cache, token):
             # False when vwap is None (set above), so this is safe to run
             # unconditionally regardless of whether vwap was available. ---
             _zw_day_open = (q.get("ohlc") or {}).get("open") or prev_close
-            if support is not None and support_dist is not None and support_dist <= NEAR_ZONE_PCT:
+
+            # --- CVD quality score inputs: recent order-flow imbalance is
+            # the same regardless of which side (support/resistance) is
+            # being scored, so it's fetched/computed ONCE per symbol here
+            # (lazily -- only for symbols that actually have a near-zone
+            # watch entry below, same "cheap by construction" design as
+            # the paper-trade CVD fetch above) rather than twice. Uses
+            # get_today_candles, which prefers the free live-feed snapshot
+            # and only falls back to a 45s-cached REST call -- safe to
+            # call for every near-zone symbol each cycle. ---
+            _zw_near_support = support is not None and support_dist is not None and support_dist <= NEAR_ZONE_PCT
+            _zw_near_resistance = resistance is not None and resistance_dist is not None and resistance_dist <= NEAR_ZONE_PCT
+            _zw_flow_pct = None
+            if _zw_near_support or _zw_near_resistance:
+                _zw_candles = get_today_candles(symbol, c["instrument_key"], token)
+                if not _zw_candles.empty:
+                    _zw_flow_pct = compute_recent_order_flow_imbalance_pct(
+                        _zw_candles, lookback=CVD_QUALITY_LOOKBACK_CANDLES
+                    )
+
+            if _zw_near_support:
+                _sup_risk_pct = _zone_break_risk_pct(support, ltp, vwap, _zw_day_open)
+                # room = distance from LTP up to the next validated zone
+                # (resistance) -- the reward side of this BUY candidate's R:R.
+                _sup_quality = compute_cvd_zone_signal(
+                    ltp, vwap, side="support", distance_pct=support_dist,
+                    room_pct=resistance_dist, order_flow_imbalance_pct=_zw_flow_pct,
+                    rvol_pct=rvol_pct, ml_break_risk_pct=_sup_risk_pct,
+                    min_vwap_distance_pct=MIN_VWAP_DISTANCE_PCT,
+                )
                 support_watch.append({
                     "symbol": symbol, "ltp": ltp,
                     "vwap": round(vwap, 2) if vwap is not None else None,
@@ -1348,9 +1678,21 @@ def run_live_scan(cache, token):
                     "zone_pct": _pct_from_label_safe(support["label"]),
                     "distance_pct": round(support_dist, 2),
                     "crossed": bool(crossed_up),
-                    "is_premium": _is_premium_zone(support, ltp, vwap, _zw_day_open),
+                    "is_premium": _is_premium_zone(support, ltp, vwap, _zw_day_open, risk_pct=_sup_risk_pct),
+                    "quality_score": _sup_quality["score"],
+                    "quality_grade": _sup_quality["grade"],
+                    "quality_components": _sup_quality["components"],
                 })
-            if resistance is not None and resistance_dist is not None and resistance_dist <= NEAR_ZONE_PCT:
+            if _zw_near_resistance:
+                _res_risk_pct = _zone_break_risk_pct(resistance, ltp, vwap, _zw_day_open)
+                # room = distance from LTP down to the next validated zone
+                # (support) -- the reward side of this SELL candidate's R:R.
+                _res_quality = compute_cvd_zone_signal(
+                    ltp, vwap, side="resistance", distance_pct=resistance_dist,
+                    room_pct=support_dist, order_flow_imbalance_pct=_zw_flow_pct,
+                    rvol_pct=rvol_pct, ml_break_risk_pct=_res_risk_pct,
+                    min_vwap_distance_pct=MIN_VWAP_DISTANCE_PCT,
+                )
                 resistance_watch.append({
                     "symbol": symbol, "ltp": ltp,
                     "vwap": round(vwap, 2) if vwap is not None else None,
@@ -1358,7 +1700,10 @@ def run_live_scan(cache, token):
                     "zone_pct": _pct_from_label_safe(resistance["label"]),
                     "distance_pct": round(resistance_dist, 2),
                     "crossed": bool(crossed_down),
-                    "is_premium": _is_premium_zone(resistance, ltp, vwap, _zw_day_open),
+                    "is_premium": _is_premium_zone(resistance, ltp, vwap, _zw_day_open, risk_pct=_res_risk_pct),
+                    "quality_score": _res_quality["score"],
+                    "quality_grade": _res_quality["grade"],
+                    "quality_components": _res_quality["components"],
                 })
 
             # --- Pure level-cross detection: no VWAP condition, no "near"
@@ -1516,7 +1861,23 @@ def _pct_from_label_safe(label):
     return float(m.group()) if m else 0.0
 
 
-def _is_premium_zone(zone, ltp, vwap, day_open):
+def _zone_break_risk_pct(zone, ltp, vwap, day_open):
+    """Shared helper: ML-predicted break probability for `zone` right now,
+    as a 0-100 percent (None if inputs are missing). Factored out of
+    _is_premium_zone so the same call/risk value can also feed
+    compute_cvd_zone_signal's composite score below, instead of predicting
+    twice for the same zone on the same tick."""
+    if ltp is None or vwap is None or day_open is None:
+        return None
+    risk = predict_break_probability(
+        zone, ltp=ltp, vwap=vwap, day_open=day_open,
+        session_start_time=MARKET_OPEN_TIME, session_end_time=MARKET_CLOSE_TIME,
+        now_time=now_ist().time(), is_intraday_validated=True,
+    )
+    return None if risk is None else risk * 100
+
+
+def _is_premium_zone(zone, ltp, vwap, day_open, risk_pct=None):
     """A 'premium' zone combines real trading volume behind it (high
     pct_of_session -- not a thin/noisy cluster) with the ML model being
     confident it'll hold rather than break. Computed fresh here rather
@@ -1525,20 +1886,20 @@ def _is_premium_zone(zone, ltp, vwap, day_open):
     properties -- a zone can be premium at one moment and not another
     as the session progresses. Returns False (not None/unknown) if
     inputs are missing, since an unproven zone shouldn't default to
-    looking premium."""
+    looking premium.
+
+    risk_pct: pass an already-computed _zone_break_risk_pct() value to
+    avoid a redundant model call when the caller needs both this bool
+    AND the raw risk number (e.g. for compute_cvd_zone_signal) -- if
+    omitted, this computes it itself."""
     zone_pct = _pct_from_label_safe(zone.get("label", ""))
     if zone_pct < PREMIUM_MIN_ZONE_PCT:
         return False
-    if ltp is None or vwap is None or day_open is None:
+    if risk_pct is None:
+        risk_pct = _zone_break_risk_pct(zone, ltp, vwap, day_open)
+    if risk_pct is None:
         return False
-    risk = predict_break_probability(
-        zone, ltp=ltp, vwap=vwap, day_open=day_open,
-        session_start_time=MARKET_OPEN_TIME, session_end_time=MARKET_CLOSE_TIME,
-        now_time=now_ist().time(), is_intraday_validated=True,
-    )
-    if risk is None:
-        return False
-    return (risk * 100) < PREMIUM_MAX_ML_RISK_PCT
+    return risk_pct < PREMIUM_MAX_ML_RISK_PCT
 
 
 def load_alert_log():
@@ -1723,7 +2084,7 @@ def get_session_x_range(df):
 
 
 # ---------------- UI (four tabs: Scanner, Key Levels, Chart, Alerts) ----------------
-st.set_page_config(page_title="Sahi Key Levels LIVE", layout="wide")
+st.set_page_config(page_title="Dr Yarapu Reddy Levels", layout="wide")
 
 # Disable Streamlit's default full-page dim/fade effect during reruns.
 # This app reruns often (multiple auto-refresh timers across tabs, all
@@ -1745,15 +2106,80 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("Sahi Key Levels LIVE")
+st.title("Dr Yarapu Reddy Levels")
 
 with st.sidebar:
+    st.markdown("### Connect to Upstox")
+    st.caption(
+        "Logs in via Upstox's own OAuth flow so the token this app gets actually carries "
+        "this app's real permissions (market data + trading). A token grabbed some other "
+        "way is what produces 'read only token' order-placement errors (UDAPI100067)."
+    )
+    _saved_oauth = load_saved_oauth_config()
+    upstox_api_key = st.text_input(
+        "API Key (Client ID)",
+        value=_saved_oauth.get("api_key") or os.environ.get("UPSTOX_API_KEY", ""),
+        key="upstox_api_key",
+    )
+    upstox_api_secret = st.text_input(
+        "API Secret",
+        value=_saved_oauth.get("api_secret") or os.environ.get("UPSTOX_API_SECRET", ""),
+        type="password", key="upstox_api_secret",
+    )
+    upstox_redirect_uri = st.text_input(
+        "Redirect URI",
+        value=_saved_oauth.get("redirect_uri") or os.environ.get("UPSTOX_REDIRECT_URI", "https://127.0.0.1"),
+        key="upstox_redirect_uri",
+        help="Must exactly match the Redirect URI registered on this app in the Upstox "
+             "developer console -- it doesn't need to be a real, reachable page.",
+    )
+    if _saved_oauth:
+        st.caption(
+            "API Key/Secret/Redirect URI filled in from a previous successful login -- "
+            f"edit above if they've changed, or delete {UPSTOX_OAUTH_CONFIG_PATH} to clear."
+        )
+
+    if upstox_api_key.strip() and upstox_redirect_uri.strip():
+        st.markdown(
+            f"[1. Log in to Upstox]({build_upstox_login_url(upstox_api_key.strip(), upstox_redirect_uri.strip())})"
+        )
+        st.caption(
+            "Opens Upstox's login page. After you approve, it redirects to your Redirect "
+            "URI with `?code=...` in the address bar -- the page itself may show an "
+            "error/404, that's fine, just copy the code value out of the URL."
+        )
+    else:
+        st.caption("Enter API Key and Redirect URI above to get a login link.")
+
+    upstox_auth_code = st.text_input("2. Paste the code from the redirect URL", key="upstox_auth_code")
+
+    if st.button("3. Exchange code for access token"):
+        if not (upstox_api_key.strip() and upstox_api_secret.strip()
+                 and upstox_redirect_uri.strip() and upstox_auth_code.strip()):
+            st.error("Fill in API Key, API Secret, Redirect URI, and the pasted code first.")
+        else:
+            ok, result = exchange_upstox_auth_code(
+                upstox_auth_code, upstox_api_key, upstox_api_secret, upstox_redirect_uri,
+            )
+            if ok:
+                st.session_state["manual_token"] = result["access_token"]
+                save_oauth_config(upstox_api_key.strip(), upstox_api_secret.strip(), upstox_redirect_uri.strip())
+                st.success(
+                    f"Logged in as {result.get('user_name', result.get('email', 'your Upstox account'))}. "
+                    "Access token is active for this app now -- nothing else to paste below. "
+                    "API Key/Secret/Redirect URI are saved for next time too."
+                )
+            else:
+                st.error(result)
+
+    st.divider()
     st.markdown("### Daily token")
     st.text_input(
         "Upstox access token (paste today's token here)",
         type="password", key="manual_token",
-        help="Overrides the server's fixed token for this app only -- replace it here each "
-             "day instead of editing the systemd service.",
+        help="Filled in automatically after a successful login above. You can also paste "
+             "a token directly here instead, as a fallback -- replace it here each day "
+             "instead of editing the systemd service.",
     )
 
 st.caption(
@@ -1867,6 +2293,67 @@ if os.path.exists(CACHE_PATH):
     symbols_with_zones = [s for s in cache if cache[s].get("composite_zones") or cache[s].get("intraday_zones")]
     default_idx = symbols_with_zones.index("NIFTY") if "NIFTY" in symbols_with_zones else 0
 
+    # The Dashboard tab's own symbol picker deliberately uses the FULL
+    # resolved F&O universe (every symbol Precompute successfully found
+    # an instrument_key for -- 231 equities + NIFTY/BANKNIFTY futures),
+    # not symbols_with_zones above. It's a single-symbol live viewer, so
+    # unlike Zone Watch/Scanner/etc. it doesn't actually need a symbol to
+    # have validated (or even any) zones to be worth looking at -- a
+    # freshly-added or thinly-traded symbol with no zones yet should
+    # still be selectable here.
+    dash_all_symbols = sorted(cache.keys())
+    dash_futures_symbols = sorted(s for s in dash_all_symbols if s in FUTURES_SYMBOLS)
+    dash_equity_symbols = sorted(s for s in dash_all_symbols if s not in FUTURES_SYMBOLS)
+
+    # --- Dashboard tab settings, in the sidebar (viewer.py-style single-
+    # symbol layout) -- added in a SECOND `with st.sidebar:` block here,
+    # after symbols_with_zones/cache exist, rather than in the first
+    # sidebar block up top (which runs before cache is loaded from disk).
+    # Streamlit appends every `with st.sidebar:` block's content into the
+    # same sidebar in script order, so this is safe and just as global as
+    # the "Daily token" section already up there -- it shows regardless
+    # of which tab is open, same as any other sidebar content would. ---
+    if dash_all_symbols:
+        with st.sidebar:
+            st.markdown("### 🏠 Dashboard")
+            dash_instrument_filter = st.radio(
+                "Instrument type", ["All", "Futures", "Equities"], index=0,
+                horizontal=True, key="dash_instrument_filter",
+                help="Futures = NIFTY/BANKNIFTY only. Equities = the rest of "
+                     "the F&O stock universe.",
+            )
+            if dash_instrument_filter == "Futures":
+                dash_symbol_universe = dash_futures_symbols or dash_all_symbols
+            elif dash_instrument_filter == "Equities":
+                dash_symbol_universe = dash_equity_symbols or dash_all_symbols
+            else:
+                dash_symbol_universe = dash_all_symbols
+            dash_default_idx = dash_symbol_universe.index("NIFTY") if "NIFTY" in dash_symbol_universe else 0
+            # The Symbol selectbox's stored value can outlive a filter
+            # switch (e.g. RELIANCE selected, then flipping to "Futures")
+            # -- reset it BEFORE the widget renders so Streamlit doesn't
+            # choke on a stored value that's no longer among the options.
+            if st.session_state.get("dash_symbol") not in dash_symbol_universe:
+                st.session_state["dash_symbol"] = dash_symbol_universe[dash_default_idx]
+            st.selectbox(
+                "Symbol", dash_symbol_universe, index=dash_default_idx, key="dash_symbol",
+            )
+            st.slider(
+                "Candles to show", min_value=30, max_value=500, value=300, step=10,
+                key="dash_candles_to_show",
+                help="Caps how many of today's already-fetched candles are plotted -- "
+                     "this app's Dashboard tab is single-session (today only), unlike "
+                     "viewer.py's multi-day view, so this mostly matters on the 1m "
+                     "interval where today alone can have 300+ candles.",
+            )
+            st.slider(
+                "Auto-refresh every (seconds)", min_value=5, max_value=60, value=15,
+                key="dash_autorefresh_secs",
+            )
+    else:
+        dash_symbol_universe = []
+        dash_default_idx = 0
+
     # --- Always-visible top summary: level breaks with real room to move ---
     # Sits above the tabs so it's visible no matter which tab is open --
     # the whole point is to avoid scrolling through 220 sector charts to
@@ -1894,8 +2381,8 @@ if os.path.exists(CACHE_PATH):
 
     st.divider()
 
-    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_range, tab_zonewatch, tab_candleclose, tab_setups, tab_paper, tab_journal, tab_replay, tab_alerts, tab_liveticks = st.tabs(
-        ["Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Wide Range", "Zone Watch", "Candle Close Signals", "Setups", "Paper Trading", "Trade Journal", "Replay", "Alerts", "Live Ticks"]
+    tab_dashboard, tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_range, tab_zonewatch, tab_candleclose, tab_setups, tab_paper, tab_journal, tab_replay, tab_alerts, tab_liveticks = st.tabs(
+        ["🏠 Dashboard", "Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Wide Range", "Zone Watch", "Candle Close Signals", "Setups", "Paper Trading", "Trade Journal", "Replay", "Alerts", "Live Ticks"]
     )
 
     with tab_journal:
@@ -1952,6 +2439,393 @@ if os.path.exists(CACHE_PATH):
             st.dataframe(closed_df, use_container_width=True, hide_index=True)
             csv = closed_df.to_csv(index=False).encode("utf-8")
             st.download_button("Download closed trades CSV", csv, "paper_trades.csv", "text/csv")
+
+    with tab_dashboard:
+        if not dash_symbol_universe:
+            st.write("No data yet - click 'Run Precompute'.")
+        else:
+            dash_symbol = st.session_state.get("dash_symbol", dash_symbol_universe[dash_default_idx])
+            if dash_symbol not in dash_symbol_universe:
+                dash_symbol = dash_symbol_universe[dash_default_idx]
+            candles_to_show = st.session_state.get("dash_candles_to_show", 300)
+            autorefresh_secs = st.session_state.get("dash_autorefresh_secs", 15)
+            token = get_token()
+            dc = cache[dash_symbol]
+
+            interval_choice = st.radio(
+                "Interval", ["1m", "5m", "15m"], index=1, horizontal=True, key="dash_interval",
+            )
+            _interval_map = {"1m": ("minutes", "1"), "5m": ("minutes", "5"), "15m": ("minutes", "15")}
+            unit, interval = _interval_map[interval_choice]
+
+            st.markdown("**Indicators**")
+            ind_col1, ind_col2, ind_col3, ind_col4, ind_col5 = st.columns(5)
+            show_vwap = ind_col1.checkbox("VWAP", value=False, key="dash_show_vwap")
+            ema_choices = ind_col2.multiselect(
+                "EMA overlays", ["EMA 9", "EMA 21", "EMA 50", "EMA 200 (18-day composite)"],
+                default=[], key="dash_ema_choices",
+            )
+            show_rvol = ind_col3.checkbox("RVOL", value=True, key="dash_show_rvol")
+            show_cvd = ind_col4.checkbox("CVD", value=False, key="dash_show_cvd")
+            show_sr = ind_col5.checkbox("18-day S/R", value=True, key="dash_show_sr")
+
+            # Feed / Connection state / Candle countdown -- moved above the
+            # chart to match viewer.py's layout. Only needs unit/interval
+            # (not the fetched candle data), so it's safe to compute and
+            # render before the fetch below.
+            #
+            # Live feed aggregates every interval in INTERVALS_SECONDS
+            # ("1"/"5"/"15") from the same tick stream -- see
+            # candle_aggregator.py -- so "LIVE" is possible at any of the
+            # three now, not just 5m; anything else (a different unit)
+            # is always REST regardless of whether feed_listener.py is
+            # running.
+            _live_check = (get_live_candles(dash_symbol, interval=interval)
+                           if unit == "minutes" and interval in INTERVALS_SECONDS else None)
+            is_live_feed = _live_check is not None and not _live_check.empty
+            secs_left = seconds_to_next_candle_close(now_ist(), int(interval))
+            m_col1, m_col2, m_col3 = st.columns(3)
+            m_col1.metric("Feed", "LIVE" if is_live_feed else "REST")
+            m_col2.metric("Connection state", "websocket" if is_live_feed else "polling")
+            m_col3.metric("Current candle closes in", f"{secs_left // 60}m {secs_left % 60}s")
+
+            # Auto-refresh ticks the WHOLE app (Streamlit has no way to
+            # scope a rerun to one tab), same pattern as the existing
+            # sidebar auto-refresh checkbox elsewhere in this file -- the
+            # tab just controls the interval, not whether other tabs also
+            # happen to redraw when it fires.
+            st_autorefresh(interval=autorefresh_secs * 1000, key="dashboard_autorefresh_tick")
+
+            dash_df_full = get_today_candles_for_interval(dash_symbol, dc["instrument_key"], token, unit, interval)
+
+            if dash_df_full.empty:
+                st.write("No candle data yet for today at this interval.")
+            else:
+                dash_df = dash_df_full.tail(candles_to_show).reset_index(drop=True)
+
+                val_comp, _, _ = cross_validated_zones(dc.get("composite_zones", []), dc.get("intraday_zones", []))
+                ltp = float(dash_df["close"].iloc[-1])
+                typical = (dash_df["high"] + dash_df["low"] + dash_df["close"]) / 3.0
+                cum_vol = dash_df["volume"].cumsum()
+                vwap_series = (typical * dash_df["volume"]).cumsum() / cum_vol.replace(0, pd.NA)
+                vwap = float(vwap_series.ffill().iloc[-1]) if cum_vol.iloc[-1] > 0 else None
+
+                dash_rvol = rvol_lookup.get(dash_symbol)
+                title_bits = [f"{dash_symbol} · {interval_choice}"]
+                if show_rvol and dash_rvol is not None:
+                    title_bits.append(f"(RVOL {dash_rvol:.0f}%)")
+
+                ml_lookup = build_ml_risk_lookup(dc.get("composite_zones", []), val_comp, dash_df) if show_sr else {}
+                fig = plot_candles_with_zones(
+                    dash_df,
+                    composite_zones=dc.get("composite_zones", []) if show_sr else [],
+                    intraday_zones=dc.get("intraday_zones", []) if show_sr else [],
+                    validated_zones=val_comp if show_sr else [],
+                    title=" ".join(title_bits),
+                    show_vwap=show_vwap,
+                    ml_risk_lookup=ml_lookup,
+                    ema_200=dc.get("ema_200") if "EMA 200 (18-day composite)" in ema_choices else None,
+                    market_hours_breaks=True,
+                )
+                for _span, _label in ((9, "EMA 9"), (21, "EMA 21"), (50, "EMA 50")):
+                    if _label in ema_choices:
+                        _ema_series = dash_df["close"].ewm(span=_span, adjust=False).mean()
+                        fig.add_trace(go.Scatter(
+                            x=dash_df["timestamp"], y=_ema_series, mode="lines", name=_label,
+                            line=dict(width=1.3),
+                        ))
+                st.plotly_chart(fig, use_container_width=True, key=f"dash_chart_{dash_symbol}_{interval_choice}")
+
+                if show_cvd:
+                    dash_cvd_fig = build_cvd_chart(dash_df, height=120)
+                    st.plotly_chart(dash_cvd_fig, use_container_width=True,
+                                     key=f"dash_cvd_{dash_symbol}_{interval_choice}")
+
+                st.markdown("**Quality signal (nearest zone)**")
+                st.caption(
+                    "Same weighted composite score as the Zone Watch tab -- ML-confidence + "
+                    "recent CVD order-flow + RVOL + room to the next zone, see "
+                    "zone_validation.compute_cvd_zone_signal. ⚪ = no real bias yet or not "
+                    "enough data, \U0001f7e1 = worth watching, \U0001f7e2 = strong composite confirmation."
+                )
+                support, support_dist, resistance, resistance_dist = nearest_zones(ltp, val_comp)
+                flow_pct = compute_recent_order_flow_imbalance_pct(dash_df, lookback=CVD_QUALITY_LOOKBACK_CANDLES)
+                day_open = float(dash_df["open"].iloc[0])
+
+                def _quality_line(zone, dist, side, room):
+                    if zone is None or dist is None:
+                        st.write(f"{side.capitalize()}: no validated zone nearby.")
+                        return
+                    risk_pct = _zone_break_risk_pct(zone, ltp, vwap, day_open)
+                    q = compute_cvd_zone_signal(
+                        ltp, vwap, side=side, distance_pct=dist, room_pct=room,
+                        order_flow_imbalance_pct=flow_pct, rvol_pct=dash_rvol, ml_break_risk_pct=risk_pct,
+                        min_vwap_distance_pct=MIN_VWAP_DISTANCE_PCT,
+                    )
+                    badge = {"BUY": "\U0001f7e2", "SELL": "\U0001f7e2", "WATCH": "\U0001f7e1", "-": "⚪"}[q["grade"]]
+                    st.write(f"{badge} **{side.capitalize()}** {zone['price_mode']:.2f} "
+                             f"({dist:.2f}% away) -- quality {q['score']:.0f}/100"
+                             + (f" [{q['grade']}]" if q["grade"] != "-" else ""))
+
+                q_col1, q_col2 = st.columns(2)
+                with q_col1:
+                    _quality_line(support, support_dist, "support", resistance_dist)
+                with q_col2:
+                    _quality_line(resistance, resistance_dist, "resistance", support_dist)
+
+                st.divider()
+                st.markdown("**Trade**")
+                dash_signal = compute_zone_signal(
+                    ltp, vwap, dc.get("composite_zones", []), dc.get("intraday_zones", []),
+                    min_distance_pct=MIN_SIGNAL_DISTANCE_PCT, min_vwap_distance_pct=MIN_VWAP_DISTANCE_PCT,
+                )
+                st.caption(
+                    f"Signal: **{dash_signal}** -- the same BUY/SELL/- gate used by Scanner, "
+                    "Alerts, and the algo's own paper-trade entries (compute_zone_signal: LTP "
+                    "vs VWAP bias + a validated zone with room to run). This is the actionable "
+                    "call; the Quality score above ranks HOW GOOD a candidate it is."
+                )
+
+                dash_trade_mode = st.radio(
+                    "Mode", ["Paper (simulated)", "Real (live money)"], index=0,
+                    horizontal=True, key="dash_trade_mode",
+                )
+                dash_is_real = dash_trade_mode.startswith("Real")
+                if dash_is_real:
+                    st.error(
+                        "⚠️ REAL MONEY MODE -- the button below sends a live MARKET "
+                        "order to your actual Upstox account (api-hft.upstox.com), not a "
+                        "simulation. Stop-loss/target shown are REFERENCE LEVELS ONLY -- they "
+                        "are not attached to the order in any way. Upstox does not manage an "
+                        "exit for you; you're responsible for closing the position yourself "
+                        "(manually, or via Upstox's own GTT/bracket order tools) before MIS "
+                        "auto-square-off."
+                    )
+
+                dash_long_candidate = build_manual_trade_candidate("long", dash_symbol, val_comp, dash_df)
+                dash_short_candidate = build_manual_trade_candidate("short", dash_symbol, val_comp, dash_df)
+
+                # F&O quantity must be a multiple of the current lot size
+                # (equities: lot_size == 1, so this collapses to the old
+                # share-count behavior). lot_size is read live from Upstox
+                # during Run Precompute -- None here means the cached entry
+                # predates that change, so Real ordering is disabled for
+                # this symbol until the user re-runs Precompute rather than
+                # risking an invalid/wrong-sized live order.
+                dash_lot_size = dc.get("lot_size")
+                if dash_lot_size and dash_lot_size > 1:
+                    dash_raw_qty = max(1, int(PAPER_TRADE_SIZE_RUPEES // ltp)) if ltp else dash_lot_size
+                    dash_lots = max(1, round(dash_raw_qty / dash_lot_size))
+                    dash_suggested_qty = dash_lots * dash_lot_size
+                else:
+                    dash_suggested_qty = max(1, int(PAPER_TRADE_SIZE_RUPEES // ltp)) if ltp else 1
+
+                # Upstox's Order API flat-out rejects AMO orders (UDAPI1162)
+                # -- outside market hours it still tries to auto-mark the
+                # order as AMO server-side and then refuses that too, which
+                # surfaces as a confusing "is_amo: False is invalid" error
+                # rather than anything mentioning market hours. Checked once
+                # here and used to disable Real ordering with a clear reason
+                # instead of letting the button send a doomed request.
+                dash_now_time = now_ist().time()
+                dash_market_open = MARKET_OPEN_TIME <= dash_now_time < MARKET_CLOSE_TIME
+
+                def _dash_trade_side(candidate, side_label, txn_type):
+                    if candidate is None:
+                        st.write(f"{side_label}: no validated zone to use as a stop-loss.")
+                        return
+                    target_str = f"{candidate['target']:.2f}" if candidate['target'] is not None else "open"
+                    st.write(
+                        f"{side_label} @ {candidate['entry_price']:.2f} | "
+                        f"Stop {candidate['stop_loss']:.2f} | Target {target_str}"
+                        + (f" | ML Risk {candidate['ml_risk_pct']:.1f}%" if candidate['ml_risk_pct'] is not None else "")
+                    )
+                    if not dash_is_real:
+                        if st.button(f"{side_label} (Paper)", key=f"dash_paper_{txn_type}_{dash_symbol}"):
+                            dash_plog = load_paper_trades()
+                            if has_open_paper_trade(dash_plog, dash_symbol):
+                                st.warning(f"Already have an open position in {dash_symbol}.")
+                            else:
+                                dash_opened = open_paper_trade(dash_plog, candidate)
+                                if dash_opened:
+                                    save_paper_trades(dash_plog)
+                                    st.session_state["paper_log"] = dash_plog
+                                    st.success(f"Opened PAPER {txn_type} on {dash_symbol}.")
+                                else:
+                                    st.warning("Position rounds to 0 shares at this price -- not opened.")
+                    elif dash_lot_size is None:
+                        st.warning(
+                            f"{dash_symbol}: lot size unknown (cached zones predate lot-size "
+                            "tracking). Click 'Run Precompute' to refresh before placing a real "
+                            "F&O order -- ordering the wrong quantity multiple gets the whole "
+                            "order rejected, or worse, accepted at the wrong size."
+                        )
+                    else:
+                        if not dash_market_open:
+                            st.warning(
+                                f"Market is closed (regular session is "
+                                f"{MARKET_OPEN_TIME.strftime('%H:%M')}-"
+                                f"{MARKET_CLOSE_TIME.strftime('%H:%M')} IST). Upstox's Order "
+                                "API doesn't support AMO (after-market) orders at all -- "
+                                "placing one now would just get rejected (UDAPI1162). Real "
+                                "ordering is disabled here until the market reopens."
+                            )
+                        dash_qty = st.number_input(
+                            f"Quantity ({side_label})"
+                            + (f" -- lot size {dash_lot_size}" if dash_lot_size > 1 else ""),
+                            min_value=dash_lot_size, value=dash_suggested_qty, step=dash_lot_size,
+                            key=f"dash_real_qty_{txn_type}_{dash_symbol}",
+                        )
+                        dash_qty_valid = int(dash_qty) % dash_lot_size == 0
+                        if not dash_qty_valid:
+                            st.error(
+                                f"Quantity must be a multiple of the lot size ({dash_lot_size}) -- "
+                                "the +/- buttons step correctly, but a typed value can still land "
+                                "off-multiple."
+                            )
+                        dash_confirm = st.checkbox(
+                            f"I confirm: REAL {txn_type} MARKET order, {int(dash_qty)} "
+                            f"{'contract unit(s)' if dash_lot_size > 1 else 'share(s)'} of "
+                            f"{dash_symbol}, on my live Upstox account",
+                            key=f"dash_real_confirm_{txn_type}_{dash_symbol}",
+                        )
+                        if st.button(
+                            f"\U0001f534 PLACE REAL {txn_type} ORDER",
+                            key=f"dash_real_btn_{txn_type}_{dash_symbol}",
+                            disabled=not (dash_confirm and dash_qty_valid and dash_market_open),
+                        ):
+                            dash_ok, dash_msg, dash_order_ids = place_real_market_order(
+                                dc["instrument_key"], int(dash_qty), txn_type, token, tag="dashboard",
+                            )
+                            if dash_ok:
+                                log_real_order(dash_symbol, txn_type, int(dash_qty), dash_order_ids, dc["instrument_key"])
+                                st.success(dash_msg)
+                            else:
+                                st.error(dash_msg)
+
+                trade_col1, trade_col2 = st.columns(2)
+                with trade_col1:
+                    _dash_trade_side(dash_long_candidate, "Buy", "BUY")
+                with trade_col2:
+                    _dash_trade_side(dash_short_candidate, "Sell", "SELL")
+
+                st.divider()
+                st.markdown("**Commodity (MCX) -- one-off test order**")
+                st.caption(
+                    "Deliberately separate from the F&O trade section above -- an isolated "
+                    "path for placing a single real MCX order, not part of the regular scan/ "
+                    "trade loop or the symbol dropdown. Currently wired for CRUDEOIL only."
+                )
+                st.error(
+                    "⚠️ Commodity orders use a DIFFERENT quantity convention than "
+                    "equities/F&O: per Upstox's own Place Order API docs, `quantity` for "
+                    "commodities means the NUMBER OF LOTS directly -- not units, and not "
+                    "multiplied by lot size (that multiplication is the F&O/equity rule "
+                    "above, it does NOT apply here). Upstox's own developer community forum "
+                    "has a report of this exact field behaving inconsistently in production "
+                    "before. Start with quantity = 1 lot, and check the ACTUAL filled "
+                    "quantity in your Upstox app/console afterward -- don't assume it matches "
+                    "what you typed until you've verified it once."
+                )
+
+                st.info(
+                    "Upstox has MCX order placement temporarily disabled platform-wide "
+                    "(their own error: \"MCX API orders are temporarily disabled. "
+                    "Meanwhile, place commodity orders on NSE (NSCOM).\"). The Fetch button "
+                    "below now looks up CRUDEOIL on NSE's commodity segment (NSCOM) instead, "
+                    "and shows the resolved exchange explicitly -- check that it does NOT "
+                    "say MCX before placing anything, since that's the one guaranteed to be "
+                    "rejected again right now."
+                )
+
+                dash_commodity_symbol = "CRUDEOIL"
+                if st.button(f"Fetch {dash_commodity_symbol} instrument info", key="dash_commodity_fetch"):
+                    try:
+                        comm_key, comm_lot_size, comm_exchange = resolve_commodity_instrument_key(
+                            dash_commodity_symbol, token,
+                        )
+                    except requests.exceptions.RequestException as e:
+                        st.error(f"Instrument lookup failed: {e}")
+                        comm_key, comm_lot_size, comm_exchange = None, None, None
+                    if comm_key is None:
+                        st.error(
+                            f"Could not resolve an active {dash_commodity_symbol} futures "
+                            "contract on NSE (NSCOM) or MCX right now."
+                        )
+                    else:
+                        comm_ltp = None
+                        try:
+                            comm_quotes = fetch_batch_quotes([comm_key], token)
+                            comm_q = next(iter(comm_quotes.values()), {})
+                            comm_ltp = comm_q.get("last_price")
+                        except requests.exceptions.RequestException as e:
+                            st.warning(f"Quote fetch failed ({e}) -- instrument resolved, but no live price to show.")
+                        st.session_state["dash_commodity_key"] = comm_key
+                        st.session_state["dash_commodity_lot_size"] = comm_lot_size
+                        st.session_state["dash_commodity_ltp"] = comm_ltp
+                        st.session_state["dash_commodity_exchange"] = comm_exchange
+
+                dash_comm_key = st.session_state.get("dash_commodity_key")
+                dash_comm_lot_size = st.session_state.get("dash_commodity_lot_size")
+                dash_comm_ltp = st.session_state.get("dash_commodity_ltp")
+                dash_comm_exchange = st.session_state.get("dash_commodity_exchange")
+
+                if not dash_comm_key:
+                    st.caption(
+                        f"Click 'Fetch {dash_commodity_symbol} instrument info' to look up "
+                        "today's active contract before placing anything."
+                    )
+                elif (dash_comm_exchange or "").upper() == "MCX":
+                    st.error(
+                        f"Resolved to an MCX contract ({dash_comm_key}) -- MCX orders are "
+                        "currently disabled by Upstox, this would just be rejected again "
+                        "(UDAPI1161). Real ordering is disabled here until this resolves to "
+                        "a non-MCX exchange."
+                    )
+                else:
+                    st.write(
+                        f"{dash_commodity_symbol}: `{dash_comm_key}` (exchange: "
+                        f"**{dash_comm_exchange or 'unknown'}**)"
+                        + (f" | LTP {dash_comm_ltp:.2f}" if dash_comm_ltp is not None else " | LTP unavailable")
+                        + (f" | Upstox lists 1 lot = {dash_comm_lot_size} unit(s) -- informational "
+                           "only, do NOT multiply the quantity field below by this"
+                           if dash_comm_lot_size else "")
+                    )
+                    dash_comm_side = st.radio(
+                        "Side", ["BUY", "SELL"], horizontal=True, key="dash_commodity_side",
+                    )
+                    dash_comm_qty = st.number_input(
+                        "Quantity (in LOTS, not units)", min_value=1, value=1, step=1,
+                        key="dash_commodity_qty",
+                    )
+                    st.caption(
+                        "Sent as a Delivery (D/NRML) order, not Intraday (I) -- this contract "
+                        "rejected Intraday outright (UDAPI100500), which is Upstox's standard "
+                        "behavior for scrips that don't support MIS; \"place a delivery order "
+                        "instead\" is their own community forum's usual fix for that error."
+                    )
+                    dash_comm_confirm = st.checkbox(
+                        f"I confirm: REAL {dash_comm_side} MARKET order (Delivery/NRML), "
+                        f"{int(dash_comm_qty)} lot(s) of {dash_commodity_symbol} "
+                        f"({dash_comm_key}), on my live Upstox account",
+                        key="dash_commodity_confirm",
+                    )
+                    if st.button(
+                        "\U0001f534 PLACE REAL COMMODITY ORDER",
+                        key="dash_commodity_btn", disabled=not dash_comm_confirm,
+                    ):
+                        dash_comm_ok, dash_comm_msg, dash_comm_order_ids = place_real_market_order(
+                            dash_comm_key, int(dash_comm_qty), dash_comm_side, token,
+                            tag="commodity-test", product="D",
+                        )
+                        if dash_comm_ok:
+                            log_real_order(
+                                dash_commodity_symbol, dash_comm_side, int(dash_comm_qty),
+                                dash_comm_order_ids, dash_comm_key,
+                            )
+                            st.success(dash_comm_msg)
+                        else:
+                            st.error(dash_comm_msg)
 
     with tab_scanner:
         st.caption(f"Last refreshed: {st.session_state.get('last_refresh_time', 'never')}")
@@ -2299,44 +3173,67 @@ if os.path.exists(CACHE_PATH):
         resistance_crossed = [r["symbol"] for r in resistance_watch if r["crossed"]]
         resistance_watching = [r["symbol"] for r in resistance_watch if not r["crossed"]]
 
-        # Premium zones (high volume% + low ML break-risk) are sorted to
-        # the front of each list and called out explicitly, rather than
-        # changing render_symbol_grid itself to understand "premium" --
-        # keeps that shared function (also used by Sectors/By RVOL/Wide
-        # Range) untouched.
-        def _sort_premium_first(symbols, watch_list):
-            premium_syms = {r["symbol"] for r in watch_list if r.get("is_premium")}
-            ordered = sorted(symbols, key=lambda s: s not in premium_syms)
-            return ordered, premium_syms
+        # Quality score (weighted composite of ML-confidence + recent CVD
+        # order-flow + RVOL + room-to-next-zone, 0-100 -- see
+        # zone_validation.compute_cvd_zone_signal) sorts each list
+        # highest-score-first and is called out explicitly, rather than
+        # changing render_symbol_grid itself to understand it -- keeps
+        # that shared function (also used by Sectors/By RVOL/Wide Range)
+        # untouched. This is a ranking on top of the existing "near a
+        # zone" membership, not an extra filter -- a low-scoring symbol
+        # still shows up, just further down.
+        def _sort_by_quality(symbols, watch_list):
+            entry_by_symbol = {r["symbol"]: r for r in watch_list}
+            ordered = sorted(
+                symbols, key=lambda s: entry_by_symbol.get(s, {}).get("quality_score", 0.0),
+                reverse=True,
+            )
+            graded = {s: entry_by_symbol[s] for s in symbols
+                      if entry_by_symbol.get(s, {}).get("quality_grade") in ("BUY", "SELL", "WATCH")}
+            return ordered, graded
 
-        support_crossed, support_crossed_premium = _sort_premium_first(support_crossed, support_watch)
-        support_watching, support_watching_premium = _sort_premium_first(support_watching, support_watch)
-        resistance_crossed, resistance_crossed_premium = _sort_premium_first(resistance_crossed, resistance_watch)
-        resistance_watching, resistance_watching_premium = _sort_premium_first(resistance_watching, resistance_watch)
+        support_crossed, support_crossed_graded = _sort_by_quality(support_crossed, support_watch)
+        support_watching, support_watching_graded = _sort_by_quality(support_watching, support_watch)
+        resistance_crossed, resistance_crossed_graded = _sort_by_quality(resistance_crossed, resistance_watch)
+        resistance_watching, resistance_watching_graded = _sort_by_quality(resistance_watching, resistance_watch)
 
-        def _premium_caption(premium_syms):
-            if premium_syms:
-                st.caption(f"⭐ Premium (>={PREMIUM_MIN_ZONE_PCT:.0f}% volume, "
-                           f"<{PREMIUM_MAX_ML_RISK_PCT:.0f}% ML break-risk): "
-                           + ", ".join(sorted(premium_syms)))
+        def _quality_caption(graded):
+            """graded: {symbol: watch-entry dict}. A BUY/SELL-grade line
+            (score >= CVD_SIGNAL_BUY_THRESHOLD) means every scored factor
+            that had data agreed strongly; a WATCH-grade line
+            (score >= CVD_SIGNAL_WATCH_THRESHOLD) is a real but imperfect
+            setup -- shown, not filtered out, per the weighted-composite
+            approach (a razor-perfect setup with one weak factor still
+              surfaces here instead of vanishing behind a strict gate)."""
+            if not graded:
+                return
+            strong = sorted((r for r in graded.values() if r["quality_grade"] in ("BUY", "SELL")),
+                             key=lambda r: r["quality_score"], reverse=True)
+            watching = sorted((r for r in graded.values() if r["quality_grade"] == "WATCH"),
+                               key=lambda r: r["quality_score"], reverse=True)
+            if strong:
+                st.caption("🟢 " + ", ".join(f"{r['symbol']} ({r['quality_score']:.0f})" for r in strong))
+            if watching:
+                st.caption("🟡 " + ", ".join(f"{r['symbol']} ({r['quality_score']:.0f})" for r in watching))
 
         st.markdown("### Watching (side by side -- buy-side vs sell-side candidates)")
         st.caption("Sitting near a zone edge, hasn't confirmed a cross yet. Support side = "
                    "bullish candidates (bounce off a floor); Resistance side = bearish "
                    "candidates (rejection off a ceiling) -- same HUDCO-style setup, mirrored. "
                    "One chart per row on each side (rather than the usual 2) so both columns "
-                   "stay readable at half width. Premium candidates are listed first.")
+                   "stay readable at half width. Ranked by quality score, highest first -- "
+                   "🟢 = strong composite confirmation (score ≥70), 🟡 = worth watching (45-69).")
         watch_col_support, watch_col_resistance = st.columns(2)
         with watch_col_support:
             st.markdown(f"**👀 Support ({len(support_watching)})**")
-            _premium_caption(support_watching_premium)
+            _quality_caption(support_watching_graded)
             if not support_watching:
                 st.caption("None right now.")
             else:
                 render_symbol_grid(support_watching, token, key_prefix="zw_supwatch", cols_per_row=1)
         with watch_col_resistance:
             st.markdown(f"**👀 Resistance ({len(resistance_watching)})**")
-            _premium_caption(resistance_watching_premium)
+            _quality_caption(resistance_watching_graded)
             if not resistance_watching:
                 st.caption("None right now.")
             else:
@@ -2346,14 +3243,14 @@ if os.path.exists(CACHE_PATH):
         st.markdown("### Crossed this cycle (confirmed -- full chart + trade actions)")
 
         st.markdown(f"**🔥 Support reclaimed -- bullish ({len(support_crossed)})**")
-        _premium_caption(support_crossed_premium)
+        _quality_caption(support_crossed_graded)
         if not support_crossed:
             st.caption("None right now.")
         else:
             render_symbol_grid(support_crossed, token, key_prefix="zw_supcross")
 
         st.markdown(f"**🔥 Resistance broken down -- bearish ({len(resistance_crossed)})**")
-        _premium_caption(resistance_crossed_premium)
+        _quality_caption(resistance_crossed_graded)
         if not resistance_crossed:
             st.caption("None right now.")
         else:

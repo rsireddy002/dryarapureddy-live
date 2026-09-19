@@ -6,6 +6,8 @@
 fno_live_candles.json
 fno_live_candles.json.tmp
 paper_trades.json
+real_orders_log.json
+upstox_oauth_config.json
 sahi_zones_cache.json
 fno_universe_cache.json
 instrument_keys_cache.json
