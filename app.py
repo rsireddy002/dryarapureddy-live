@@ -80,14 +80,26 @@ from candle_aggregator import INTERVALS_SECONDS  # which intervals the live feed
 # and feed_listener.py. Applied globally here (not just around the real-
 # order call below) since it's a no-op on an IPv4-only network and every
 # Upstox API call in this app benefits from it, not just order placement.
-_orig_getaddrinfo = socket.getaddrinfo
+#
+# GUARDED to run only once per process (via a marker on the socket module
+# itself, not a local/global variable in this file) -- Streamlit reruns
+# this entire script on every interaction, but reuses the SAME process and
+# module namespace each time rather than starting fresh. Without the
+# guard, the second rerun would read socket.getaddrinfo (already patched
+# by the first rerun) into _orig_getaddrinfo, then redefine
+# _getaddrinfo_ipv4_only -- and since that function looks up
+# _orig_getaddrinfo BY NAME each call (not a frozen reference), it would
+# end up resolving to itself and recurse forever the next time it's
+# called. This is exactly what produced the RecursionError seen on
+# Streamlit Cloud after the app had been running for a while.
+if not getattr(socket, "_dryarapureddy_ipv4_patched", False):
+    _orig_getaddrinfo = socket.getaddrinfo
 
+    def _getaddrinfo_ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
 
-def _getaddrinfo_ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
-    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
-
-
-socket.getaddrinfo = _getaddrinfo_ipv4_only
+    socket.getaddrinfo = _getaddrinfo_ipv4_only
+    socket._dryarapureddy_ipv4_patched = True
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
