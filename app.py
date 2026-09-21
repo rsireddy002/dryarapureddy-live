@@ -143,7 +143,7 @@ TRIPLE_CROSS_LOG_PATH = "triple_cross_log.json"  # written by tick_paper_trader.
 # standalone version for the full explanation. Read-only here, no new
 # dependency: just os/json, both already used elsewhere in this file.
 
-DAILY_LOOKBACK_DAYS = 30         # needs enough history for RVOL_BASELINE_DAYS average
+DAILY_LOOKBACK_DAYS = 60         # needs enough history for RVOL_BASELINE_DAYS average
 COMPOSITE_LOOKBACK_DAYS = 18     # matches hvn-lvn-scanner's multi-day window
 RVOL_BASELINE_DAYS = 20          # prior-N-day average full-day volume, same convention as hvn-lvn-scanner
 TOP_N_RVOL = 5                   # only symbols in the top N by RVOL are eligible to alert
