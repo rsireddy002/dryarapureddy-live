@@ -143,7 +143,16 @@ TRIPLE_CROSS_LOG_PATH = "triple_cross_log.json"  # written by tick_paper_trader.
 # standalone version for the full explanation. Read-only here, no new
 # dependency: just os/json, both already used elsewhere in this file.
 
-DAILY_LOOKBACK_DAYS = 60         # needs enough history for RVOL_BASELINE_DAYS average
+DAILY_LOOKBACK_DAYS = 60         # needs enough history for RVOL_BASELINE_DAYS average --
+                                  # was 30, but Upstox's historical-candle endpoint only
+                                  # returns finalized/settled days (lags behind "now" by a
+                                  # few trading days -- see candle_store.py's writeup on
+                                  # algotrade-unified-v2 for the same underlying behavior),
+                                  # so 30 calendar days plus that lag plus any holidays could
+                                  # land under RVOL_BASELINE_DAYS trading days -- exactly what
+                                  # was happening: avg_daily_volume ended up None for every
+                                  # symbol, so RVOL% showed "None" everywhere despite LTP/VWAP
+                                  # working fine. 60 calendar days leaves a comfortable margin.
 COMPOSITE_LOOKBACK_DAYS = 18     # matches hvn-lvn-scanner's multi-day window
 RVOL_BASELINE_DAYS = 20          # prior-N-day average full-day volume, same convention as hvn-lvn-scanner
 TOP_N_RVOL = 5                   # only symbols in the top N by RVOL are eligible to alert
@@ -2358,6 +2367,13 @@ if os.path.exists(CACHE_PATH):
                      "viewer.py's multi-day view, so this mostly matters on the 1m "
                      "interval where today alone can have 300+ candles.",
             )
+            st.checkbox(
+                "Auto-refresh this chart -- own timer, same pattern as Live Ticks' "
+                "toggle below, off by default so opening this tab doesn't force the "
+                "whole app to rerun every few seconds on its own (this was previously "
+                "unconditional and a major cause of sluggishness, especially on mobile)",
+                value=False, key="dash_autorefresh_on",
+            )
             st.slider(
                 "Auto-refresh every (seconds)", min_value=5, max_value=60, value=15,
                 key="dash_autorefresh_secs",
@@ -2505,8 +2521,12 @@ if os.path.exists(CACHE_PATH):
             # scope a rerun to one tab), same pattern as the existing
             # sidebar auto-refresh checkbox elsewhere in this file -- the
             # tab just controls the interval, not whether other tabs also
-            # happen to redraw when it fires.
-            st_autorefresh(interval=autorefresh_secs * 1000, key="dashboard_autorefresh_tick")
+            # happen to redraw when it fires. Gated behind dash_autorefresh_on
+            # (off by default) -- this used to fire unconditionally every
+            # time this tab was open, which was a major cause of mobile
+            # sluggishness (constant full-script reruns with no opt-out).
+            if st.session_state.get("dash_autorefresh_on", False):
+                st_autorefresh(interval=autorefresh_secs * 1000, key="dashboard_autorefresh_tick")
 
             dash_df_full = get_today_candles_for_interval(dash_symbol, dc["instrument_key"], token, unit, interval)
 
