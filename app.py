@@ -228,25 +228,25 @@ EQUITY_SYMBOLS = [
     "TECHM", "GRASIM", "DIVISLAB", "DRREDDY", "CIPLA", "EICHERMOT",
     "HEROMOTOCO", "HINDALCO", "BPCL", "BRITANNIA", "APOLLOHOSP", "SBILIFE",
     "HDFCLIFE", "INDUSINDBK", "BAJAJ-AUTO", "TATACONSUM", "UPL", "SHREECEM",
-    "NESTLEIND", "VEDANTA", "GAIL", "PIDILITIND", "DLF", "GODREJCP",
+    "NESTLEIND", "GAIL", "PIDILITIND", "DLF", "GODREJCP",
     "SIEMENS", "AMBUJACEM", "BANDHANBNK", "BANKBARODA", "PNB", "CANBK",
     "IDFCFIRSTB", "FEDERALBNK", "AUROPHARMA", "BEL", "BIOCON", "CHOLAFIN",
     "COLPAL", "CONCOR", "CUMMINSIND", "DABUR", "DEEPAKNTR", "ESCORTS",
     "EXIDEIND", "GODREJPROP", "HAVELLS", "HDFCAMC", "ICICIGI", "ICICIPRULI",
     "IEX", "INDIGO", "INDUSTOWER", "IOC", "IRCTC", "JINDALSTEL", "JUBLFOOD",
-    "LICHSGFIN", "LTIM", "LUPIN", "MANAPPURAM", "MARICO", "MCDOWELL-N",
+    "LICHSGFIN", "LTM", "LUPIN", "MANAPPURAM", "MARICO", "UNITDSPR",
     "MFSL", "MOTHERSON", "MPHASIS", "MRF", "MUTHOOTFIN", "NAUKRI",
-    "NMDC", "OBEROIRLTY", "OFSS", "PAGEIND", "PEL", "PERSISTENT",
+    "NMDC", "OBEROIRLTY", "OFSS", "PAGEIND", "PIRAMALFIN", "PERSISTENT",
     "PETRONET", "PFC", "PIIND", "POLYCAB", "RECLTD", "SAIL", "SBICARD",
     "SRF", "SYNGENE", "TATACOMM", "TATAPOWER", "TORNTPHARM", "TRENT",
     "TVSMOTOR", "UBL", "VOLTAS", "ZEEL", "ZYDUSLIFE", "CDSL", "IRFC",
     "IDEA", "YESBANK", "SUZLON", "ETERNAL", "DMART", "JIOFIN", "PAYTM",
     "NYKAA", "POLICYBZR", "DELHIVERY", "LODHA", "PATANJALI", "ABCAPITAL",
-    "ALKEM", "APLAPOLLO", "ASHOKLEY", "ASTRAL", "ATUL", "BALKRISNIND",
+    "ALKEM", "APLAPOLLO", "ASHOKLEY", "ASTRAL", "ATUL", "BALKRISIND",
     "BATAINDIA", "BHARATFORG", "BHEL", "BSOFT", "CANFINHOME", "CROMPTON",
-    "CUB", "DALBHARAT", "GLENMARK", "GMRINFRA", "GNFC", "GRANULES",
-    "GUJGASLTD", "HAL", "HINDCOPPER", "HINDPETRO", "IBULHSGFIN", "IGL",
-    "INDHOTEL", "INDIAMART", "IPCALAB", "JKCEMENT", "L&TFH", "LALPATHLAB",
+    "CUB", "DALBHARAT", "GLENMARK", "GMRAIRPORT", "GNFC", "GRANULES",
+    "GUJGASLTD", "HAL", "HINDCOPPER", "HINDPETRO", "SAMMAANCAP", "IGL",
+    "INDHOTEL", "INDIAMART", "IPCALAB", "JKCEMENT", "LALPATHLAB",
     "LAURUSLABS", "M&MFIN", "METROPOLIS", "NATIONALUM", "NAVINFLUOR",
     "OIL", "PVRINOX", "RAIN", "RBLBANK", "SUNTV", "TATACHEM",
     "TATAELXSI", "TORNTPOWER", "UNIONBANK", "VBL", "WHIRLPOOL",
@@ -281,11 +281,11 @@ SECTOR_MAP = {
     "BAJFINANCE": "NBFC", "BAJAJFINSV": "NBFC", "CHOLAFIN": "NBFC",
     "MANAPPURAM": "NBFC", "MUTHOOTFIN": "NBFC", "LICHSGFIN": "NBFC",
     "MFSL": "NBFC", "PFC": "NBFC", "RECLTD": "NBFC", "SBICARD": "NBFC",
-    "ABCAPITAL": "NBFC", "CANFINHOME": "NBFC", "IBULHSGFIN": "NBFC",
+    "ABCAPITAL": "NBFC", "CANFINHOME": "NBFC", "SAMMAANCAP": "NBFC",
     "L&TFH": "NBFC", "M&MFIN": "NBFC", "LTF": "NBFC", "HUDCO": "NBFC",
     "IIFL": "NBFC", "MOTILALOFS": "NBFC", "ANGELONE": "NBFC",
     "JIOFIN": "NBFC", "SHRIRAMFIN": "NBFC", "HDFCAMC": "NBFC",
-    "PAYTM": "NBFC", "POLICYBZR": "NBFC", "PEL": "NBFC",
+    "PAYTM": "NBFC", "POLICYBZR": "NBFC", "PIRAMALFIN": "NBFC",
 
     # Insurance
     "SBILIFE": "Insurance", "HDFCLIFE": "Insurance", "ICICIGI": "Insurance",
@@ -296,7 +296,7 @@ SECTOR_MAP = {
 
     # IT
     "TCS": "IT", "INFY": "IT", "HCLTECH": "IT", "WIPRO": "IT", "TECHM": "IT",
-    "LTIM": "IT", "MPHASIS": "IT", "PERSISTENT": "IT", "COFORGE": "IT",
+    "LTM": "IT", "MPHASIS": "IT", "PERSISTENT": "IT", "COFORGE": "IT",
     "OFSS": "IT", "NAUKRI": "IT", "BSOFT": "IT", "TATAELXSI": "IT",
     "INDIAMART": "IT",
 
@@ -304,7 +304,7 @@ SECTOR_MAP = {
     "MARUTI": "Auto", "M&M": "Auto", "TMPV": "Auto", "EICHERMOT": "Auto",
     "HEROMOTOCO": "Auto", "BAJAJ-AUTO": "Auto", "TVSMOTOR": "Auto",
     "ASHOKLEY": "Auto", "MOTHERSON": "Auto", "BHARATFORG": "Auto",
-    "BALKRISNIND": "Auto", "MRF": "Auto", "APOLLOTYRE": "Auto",
+    "BALKRISIND": "Auto", "MRF": "Auto", "APOLLOTYRE": "Auto",
     "EXIDEIND": "Auto", "ESCORTS": "Auto", "SONACOMS": "Auto",
     "TIINDIA": "Auto", "ZFCVINDIA": "Auto",
 
@@ -389,7 +389,7 @@ SECTOR_MAP = {
 
     # Aviation / Logistics
     "INDIGO": "Aviation & Logistics", "CONCOR": "Aviation & Logistics",
-    "GMRINFRA": "Aviation & Logistics", "DELHIVERY": "Aviation & Logistics",
+    "GMRAIRPORT": "Aviation & Logistics", "DELHIVERY": "Aviation & Logistics",
 
     # Hotels & Travel
     "IRCTC": "Hotels & Travel", "INDHOTEL": "Hotels & Travel",
@@ -511,14 +511,97 @@ def save_oauth_config(api_key, api_secret, redirect_uri):
         pass
 
 
+import gzip as _gzip
+import io as _io
+from datetime import date as _date
+
+INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+
+
+def _get_with_backoff(url, headers=None, params=None, timeout=20, max_retries=5, base_delay=1.5):
+    """requests.get wrapper that retries on 429 (honoring Retry-After if
+    sent) AND on connection-level failures (DNS/network drops), instead
+    of raising immediately on either. After max_retries, re-raises the
+    last connection error if that's what kept failing, or returns the
+    last 429 response (unchanged behavior: caller's .raise_for_status(),
+    if any, surfaces that final failure)."""
+    last_exc = None
+    resp = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_exc = e
+            time.sleep(base_delay * (2 ** attempt))
+            continue
+        if resp.status_code != 429:
+            return resp
+        retry_after = resp.headers.get("Retry-After")
+        delay = float(retry_after) if retry_after else base_delay * (2 ** attempt)
+        time.sleep(delay)
+    if resp is None and last_exc is not None:
+        raise last_exc
+    return resp
+
+
+def _equity_master_cache_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         f"instrument_master_{_date.today().isoformat()}.json")
+
+
+def _load_equity_master_map():
+    """Downloads Upstox's full instrument master once per calendar day
+    (cached to disk), returns {TRADING_SYMBOL: instrument_key} for NSE
+    cash-market equities. Replaces 220 individual /instruments/search
+    calls with a single download."""
+    path = _equity_master_cache_path()
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            master = json.load(f)
+    else:
+        resp = requests.get(INSTRUMENT_MASTER_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
+        resp.raise_for_status()
+        with _gzip.GzipFile(fileobj=_io.BytesIO(resp.content)) as gz:
+            master = json.load(gz)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(master, f)
+        os.replace(tmp, path)
+    return {
+        inst["trading_symbol"].upper(): inst["instrument_key"]
+        for inst in master
+        if inst.get("segment") == "NSE_EQ" and inst.get("instrument_type") in ("EQ", "BE")
+        and inst.get("trading_symbol")
+    }
+
+
+_EQUITY_MASTER_MAP = None
+
+
 def resolve_equity_instrument_key(symbol, token):
     """Returns (instrument_key, lot_size) -- lot_size is always 1 for
     equities (quantity there just means share count), returned anyway so
-    callers can treat equities and futures uniformly."""
+    callers can treat equities and futures uniformly.
+
+    PATCHED: looks up the bulk instrument master first (one download/day,
+    zero per-symbol API calls) instead of hitting /instruments/search 220
+    times per precompute run -- that loop was the source of the 429 flood.
+    Falls back to the old search-based lookup only if the symbol isn't
+    found in the master (e.g. a very recently listed stock)."""
+    global _EQUITY_MASTER_MAP
+    if _EQUITY_MASTER_MAP is None:
+        try:
+            _EQUITY_MASTER_MAP = _load_equity_master_map()
+        except Exception:
+            _EQUITY_MASTER_MAP = {}
+    key = _EQUITY_MASTER_MAP.get(symbol.upper())
+    if key:
+        return key, 1
+
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     params = {"query": symbol, "exchanges": "NSE", "segments": "EQ",
               "instrument_types": "EQ", "page_number": 1, "records": 10}
-    resp = requests.get(INSTRUMENT_SEARCH_URL, headers=headers, params=params, timeout=20)
+    resp = _get_with_backoff(INSTRUMENT_SEARCH_URL, headers=headers, params=params)
     resp.raise_for_status()
     candidates = [inst for inst in resp.json().get("data", [])
                   if inst.get("trading_symbol", "").upper() == symbol.upper()]
@@ -538,7 +621,7 @@ def resolve_futures_instrument_key(name, token):
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     params = {"query": name, "exchanges": "NSE", "segments": "FO",
               "instrument_types": "FUT", "page_number": 1, "records": 30}
-    resp = requests.get(INSTRUMENT_SEARCH_URL, headers=headers, params=params, timeout=20)
+    resp = _get_with_backoff(INSTRUMENT_SEARCH_URL, headers=headers, params=params)
     resp.raise_for_status()
     candidates = [inst for inst in resp.json().get("data", [])
                   if inst.get("instrument_type") == "FUT"
@@ -584,7 +667,7 @@ def resolve_commodity_instrument_key(name, token):
     def _search(exchanges):
         params = {"query": name, "exchanges": exchanges, "segments": "COMM",
                   "instrument_types": "FUT", "page_number": 1, "records": 30}
-        resp = requests.get(INSTRUMENT_SEARCH_URL, headers=headers, params=params, timeout=20)
+        resp = _get_with_backoff(INSTRUMENT_SEARCH_URL, headers=headers, params=params)
         if resp.status_code >= 400:
             return []
         return resp.json().get("data", [])
@@ -607,7 +690,7 @@ def fetch_candles(instrument_key, token, unit, interval, lookback_days):
     from_date = (now_ist() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     url = f"https://api.upstox.com/v3/historical-candle/{instrument_key}/{unit}/{interval}/{to_date}/{from_date}"
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
-    resp = requests.get(url, headers=headers, timeout=20)
+    resp = _get_with_backoff(url, headers=headers)
     resp.raise_for_status()
     candles = resp.json().get("data", {}).get("candles", [])
     if not candles:
@@ -860,7 +943,7 @@ def get_today_candles_for_interval(symbol, instrument_key, token, unit, interval
 
 def run_precompute(token, progress_callback=None):
     cache = {}
-    all_symbols = [(s, "equity") for s in EQUITY_SYMBOLS] + [(s, "futures") for s in FUTURES_SYMBOLS]
+    all_symbols = [(s, "futures") for s in FUTURES_SYMBOLS] + [(s, "equity") for s in EQUITY_SYMBOLS]
     for i, (symbol, kind) in enumerate(all_symbols):
         try:
             key, lot_size = (resolve_equity_instrument_key(symbol, token) if kind == "equity"
@@ -1549,7 +1632,11 @@ def run_live_scan(cache, token):
     symbols = list(cache.keys())
     instrument_keys = [cache[s]["instrument_key"] for s in symbols]
     key_to_symbol = {cache[s]["instrument_key"]: s for s in symbols}
-    quotes = fetch_batch_quotes(instrument_keys, token)
+    try:
+        quotes = fetch_batch_quotes(instrument_keys, token)
+    except requests.exceptions.RequestException as e:
+        st.warning(f"Live scan skipped this cycle (network error: {e}).")
+        return (pd.DataFrame(), {}, set(), [], [], [], [], [], [], [])
 
     rows = []
     signals = {}
