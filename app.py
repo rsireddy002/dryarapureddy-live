@@ -2541,8 +2541,8 @@ if os.path.exists(CACHE_PATH):
 
     st.divider()
 
-    tab_dashboard, tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_range, tab_zonewatch, tab_candleclose, tab_setups, tab_paper, tab_journal, tab_replay, tab_alerts, tab_liveticks = st.tabs(
-        ["🏠 Dashboard", "Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Wide Range", "Zone Watch", "Candle Close Signals", "Setups", "Paper Trading", "Trade Journal", "Replay", "Alerts", "Live Ticks"]
+    tab_dashboard, tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_range, tab_breakout, tab_zonewatch, tab_candleclose, tab_setups, tab_paper, tab_journal, tab_replay, tab_alerts, tab_liveticks = st.tabs(
+        ["🏠 Dashboard", "Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Wide Range", "Breakout Watch", "Zone Watch", "Candle Close Signals", "Setups", "Paper Trading", "Trade Journal", "Replay", "Alerts", "Live Ticks"]
     )
 
     with tab_journal:
@@ -3325,6 +3325,117 @@ if os.path.exists(CACHE_PATH):
             st.divider()
             token = get_token()
             render_symbol_grid(shown_range_df["Symbol"].tolist(), token, key_prefix="range")
+
+    with tab_breakout:
+        st.caption(
+            "Two setups worth watching: 'Open Air' stocks have a validated zone "
+            "on only ONE side (support or resistance) -- the other side has "
+            "nothing to slow price down, which tends to produce sharp, "
+            "one-directional moves. 'Testing Support Floor' flags stocks "
+            "currently sitting right at the bottom edge of a support zone -- "
+            "the setup stage, before a potential move through and past it, "
+            "rather than flagging it only after the breakout already happened."
+        )
+
+        st.markdown("### Room to Run (pre-market, based on prev close)")
+        st.caption(
+            "Uses PREVIOUS CLOSE (known before market open) as the reference "
+            "point -- splits composite zones into support-side (below prev "
+            "close) and resistance-side (above). A side counts as having room "
+            "if it has no zone at all, only one zone, OR the gap to the "
+            "second-nearest zone on that side is at least 2% -- real room "
+            "once the near level is crossed. A tight cluster of levels close "
+            "together does NOT qualify even if open air exists further out, "
+            "since price has to fight through each one first."
+        )
+        _ROOM_THRESHOLD_PCT = st.slider(
+            "Minimum gap to count as room (%)", min_value=0.5, max_value=5.0,
+            value=2.0, step=0.5, key="room_threshold_pct",
+        )
+
+        def _side_room(_prev_close, _side_zones):
+            """Returns (is_open, detail_str) for one side's sorted-by-
+            distance zone list."""
+            if not _side_zones:
+                return True, "no zone this side"
+            if len(_side_zones) == 1:
+                return True, f"only zone {_side_zones[0]['price_mode']:.0f}"
+            _gap_pct = abs(_side_zones[1]["price_mode"] - _side_zones[0]["price_mode"]) / _prev_close * 100
+            _detail = f"{_side_zones[0]['price_mode']:.0f} -> {_side_zones[1]['price_mode']:.0f} gap {_gap_pct:.1f}%"
+            return _gap_pct >= _ROOM_THRESHOLD_PCT, _detail
+
+        _room_rows = []
+        for _sym in symbols_with_zones:
+            _c = cache[_sym]
+            _prev_close = _c.get("prev_close")
+            _comp_zones = _c.get("composite_zones", [])
+            if _prev_close is None or not _comp_zones:
+                continue
+            _support_side = sorted(
+                [z for z in _comp_zones if z["price_mode"] <= _prev_close],
+                key=lambda z: _prev_close - z["price_mode"],
+            )
+            _resistance_side = sorted(
+                [z for z in _comp_zones if z["price_mode"] > _prev_close],
+                key=lambda z: z["price_mode"] - _prev_close,
+            )
+            _sup_open, _sup_detail = _side_room(_prev_close, _support_side)
+            _res_open, _res_detail = _side_room(_prev_close, _resistance_side)
+            if _sup_open or _res_open:
+                _open_sides = []
+                if _sup_open:
+                    _open_sides.append(f"Support side ({_sup_detail})")
+                if _res_open:
+                    _open_sides.append(f"Resistance side ({_res_detail})")
+                _rvol = rvol_lookup.get(_sym)
+                _room_rows.append({
+                    "Symbol": _sym,
+                    "RVOL%": round(_rvol, 0) if _rvol is not None else None,
+                    "Open side(s)": "; ".join(_open_sides),
+                })
+
+        if not _room_rows:
+            st.write("No stocks meet the room threshold right now.")
+        else:
+            _room_df = pd.DataFrame(_room_rows).sort_values(
+                "RVOL%", ascending=False, na_position="last"
+            ).reset_index(drop=True)
+            st.dataframe(_room_df, use_container_width=True, hide_index=True)
+            st.divider()
+            _token = get_token()
+            render_symbol_grid(_room_df["Symbol"].tolist(), _token, key_prefix="roomcheck")
+
+        st.divider()
+        st.markdown("### Testing Support Floor")
+        _floor_threshold_pct = st.slider(
+            "Flag when price is within this % of the support zone's bottom edge",
+            min_value=0.1, max_value=2.0, value=0.5, step=0.1, key="floor_threshold_pct",
+        )
+        _floor_rows = []
+        for _sym in symbols_with_zones:
+            _c = cache[_sym]
+            _ltp = price_lookup.get(_sym)
+            if _ltp is None:
+                continue
+            _val_comp, _, _ = cross_validated_zones(_c.get("composite_zones", []), _c.get("intraday_zones", []))
+            _best = None
+            for _z in _val_comp:
+                if _z["price_mode"] > _ltp:
+                    continue
+                _dist_to_floor = abs(_ltp - _z["price_low"]) / _ltp * 100
+                if _dist_to_floor <= _floor_threshold_pct and (_best is None or _dist_to_floor < _best[1]):
+                    _best = (_z, _dist_to_floor)
+            if _best is not None:
+                _floor_rows.append({"Symbol": _sym, "Distance to floor %": round(_best[1], 2)})
+
+        if not _floor_rows:
+            st.write("No stocks currently testing a support floor within that threshold.")
+        else:
+            _floor_df = pd.DataFrame(_floor_rows).sort_values("Distance to floor %").reset_index(drop=True)
+            st.dataframe(_floor_df, use_container_width=True, hide_index=True)
+            st.divider()
+            _token2 = get_token()
+            render_symbol_grid(_floor_df["Symbol"].tolist(), _token2, key_prefix="floor")
 
     with tab_zonewatch:
         st.caption(
