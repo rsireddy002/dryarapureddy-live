@@ -2680,6 +2680,8 @@ if os.path.exists(CACHE_PATH):
                     title_bits.append(f"(RVOL {dash_rvol:.0f}%)")
 
                 ml_lookup = build_ml_risk_lookup(dc.get("composite_zones", []), val_comp, dash_df) if show_sr else {}
+                _dash_padding = (dash_df["high"].max() - dash_df["low"].min()) * 0.05
+                _dash_y_range = (dash_df["low"].min() - _dash_padding, dash_df["high"].max() + _dash_padding)
                 fig = plot_candles_with_zones(
                     dash_df,
                     composite_zones=dc.get("composite_zones", []) if show_sr else [],
@@ -2690,6 +2692,7 @@ if os.path.exists(CACHE_PATH):
                     ml_risk_lookup=ml_lookup,
                     ema_200=dc.get("ema_200") if "EMA 200 (18-day composite)" in ema_choices else None,
                     market_hours_breaks=True,
+                    y_range=_dash_y_range,
                 )
                 for _span, _label in ((9, "EMA 9"), (21, "EMA 21"), (50, "EMA 50")):
                     if _label in ema_choices:
@@ -3050,6 +3053,8 @@ if os.path.exists(CACHE_PATH):
                 chart_rvol = rvol_lookup.get(chart_symbol)
                 chart_title = (f"{chart_symbol} - price with key levels (RVOL {chart_rvol:.0f}%)"
                                if chart_rvol is not None else f"{chart_symbol} - price with key levels")
+                _chart_padding = (chart_df["high"].max() - chart_df["low"].min()) * 0.05
+                _chart_y_range = (chart_df["low"].min() - _chart_padding, chart_df["high"].max() + _chart_padding)
                 fig = plot_candles_with_zones(
                     chart_df,
                     composite_zones=c.get("composite_zones", []),
@@ -3059,6 +3064,7 @@ if os.path.exists(CACHE_PATH):
                     x_range=get_session_x_range(chart_df),
                     ml_risk_lookup=ml_lookup,
                     ema_200=c.get("ema_200"),
+                    y_range=_chart_y_range,
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -3191,6 +3197,8 @@ if os.path.exists(CACHE_PATH):
                             )
                             grid_rvol = rvol_lookup.get(sym)
                             grid_title = f"{sym} (RVOL {grid_rvol:.0f}%)" if grid_rvol is not None else sym
+                            _grid_padding = (grid_df["high"].max() - grid_df["low"].min()) * 0.05
+                            _grid_y_range = (grid_df["low"].min() - _grid_padding, grid_df["high"].max() + _grid_padding)
                             fig = plot_candles_with_zones(
                                 grid_df,
                                 composite_zones=[],   # hide faint reference lines in grid view -- too busy at small size
@@ -3202,6 +3210,7 @@ if os.path.exists(CACHE_PATH):
                                 x_range=get_session_x_range(grid_df),
                                 ml_risk_lookup=ml_lookup,
                                 ema_200=c.get("ema_200"),
+                                y_range=_grid_y_range,
                             )
                             st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_chart_{sym}")
 
