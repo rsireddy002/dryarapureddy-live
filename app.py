@@ -245,14 +245,14 @@ EQUITY_SYMBOLS = [
     "ALKEM", "APLAPOLLO", "ASHOKLEY", "ASTRAL", "ATUL", "BALKRISIND",
     "BATAINDIA", "BHARATFORG", "BHEL", "BSOFT", "CANFINHOME", "CROMPTON",
     "CUB", "DALBHARAT", "GLENMARK", "GMRAIRPORT", "GNFC", "GRANULES",
-    "GUJGASLTD", "HAL", "HINDCOPPER", "HINDPETRO", "SAMMAANCAP", "IGL",
+    "HAL", "HINDCOPPER", "HINDPETRO", "SAMMAANCAP", "IGL",
     "INDHOTEL", "INDIAMART", "IPCALAB", "JKCEMENT", "LALPATHLAB",
     "LAURUSLABS", "M&MFIN", "METROPOLIS", "NATIONALUM", "NAVINFLUOR",
     "OIL", "PVRINOX", "RAIN", "RBLBANK", "SUNTV", "TATACHEM",
     "TATAELXSI", "TORNTPOWER", "UNIONBANK", "VBL", "WHIRLPOOL",
     "AARTIIND", "ABFRL", "ANGELONE", "APOLLOTYRE", "AUBANK", "BANKINDIA",
     "BSE", "CGPOWER", "CHAMBLFERT", "COFORGE", "COROMANDEL", "DIXON",
-    "FORTIS", "GICRE", "GODFRYPHLP", "GRAPHITE", "GSPL", "HFCL",
+    "FORTIS", "GICRE", "GODFRYPHLP", "GRAPHITE", "HFCL",
     "HUDCO", "IIFL", "INDIACEM", "IRB", "ITI", "KALYANKJIL",
     "KEI", "LTF", "MANKIND", "MAXHEALTH", "MGL", "MOTILALOFS",
     "NBCC", "NCC", "NHPC", "PFIZER", "PGEL", "POWERINDIA",
@@ -337,8 +337,7 @@ SECTOR_MAP = {
     "RELIANCE": "Oil & Gas", "ONGC": "Oil & Gas", "COALINDIA": "Oil & Gas",
     "GAIL": "Oil & Gas", "BPCL": "Oil & Gas", "IOC": "Oil & Gas",
     "HINDPETRO": "Oil & Gas", "PETRONET": "Oil & Gas", "OIL": "Oil & Gas",
-    "GSPL": "Oil & Gas", "IGL": "Oil & Gas", "MGL": "Oil & Gas",
-    "GUJGASLTD": "Oil & Gas",
+    "IGL": "Oil & Gas", "MGL": "Oil & Gas",
 
     # Power
     "NTPC": "Power", "POWERGRID": "Power", "TATAPOWER": "Power",
@@ -575,6 +574,42 @@ def _load_equity_master_map():
     }
 
 
+_FUTURES_MASTER_MAP = None
+
+
+def _load_futures_master_map():
+    """Reuses the SAME cached instrument master file (no extra download)
+    to build {UNDERLYING_SYMBOL: (instrument_key, lot_size)} for NSE_FO
+    index futures, nearest expiry per underlying. Fixes the persistent
+    429s on NIFTY/BANKNIFTY, which always used to hit the search API."""
+    path = _equity_master_cache_path()
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            master = json.load(f)
+    else:
+        resp = requests.get(INSTRUMENT_MASTER_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
+        resp.raise_for_status()
+        with _gzip.GzipFile(fileobj=_io.BytesIO(resp.content)) as gz:
+            master = json.load(gz)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(master, f)
+        os.replace(tmp, path)
+
+    nearest_by_underlying = {}
+    for inst in master:
+        if inst.get("segment") != "NSE_FO" or inst.get("instrument_type") != "FUT":
+            continue
+        underlying = (inst.get("underlying_symbol") or "").upper()
+        if not underlying:
+            continue
+        expiry = inst.get("expiry", 0)
+        current = nearest_by_underlying.get(underlying)
+        if current is None or expiry < current[2]:
+            nearest_by_underlying[underlying] = (inst["instrument_key"], inst.get("lot_size"), expiry)
+    return {k: (v[0], v[1]) for k, v in nearest_by_underlying.items()}
+
+
 _EQUITY_MASTER_MAP = None
 
 
@@ -618,6 +653,16 @@ def resolve_futures_instrument_key(name, token):
     Upstox's own instrument-search response (never hardcoded) since NSE
     periodically revises F&O lot sizes -- a stale hardcoded value would
     silently produce a wrong-sized real order once a revision happens."""
+    global _FUTURES_MASTER_MAP
+    if _FUTURES_MASTER_MAP is None:
+        try:
+            _FUTURES_MASTER_MAP = _load_futures_master_map()
+        except Exception:
+            _FUTURES_MASTER_MAP = {}
+    bulk_hit = _FUTURES_MASTER_MAP.get(name.upper())
+    if bulk_hit:
+        return bulk_hit[0], (int(bulk_hit[1]) if bulk_hit[1] else None)
+
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     params = {"query": name, "exchanges": "NSE", "segments": "FO",
               "instrument_types": "FUT", "page_number": 1, "records": 30}
