@@ -2693,6 +2693,7 @@ if os.path.exists(CACHE_PATH):
                     ema_200=dc.get("ema_200") if "EMA 200 (18-day composite)" in ema_choices else None,
                     market_hours_breaks=True,
                     y_range=_dash_y_range,
+                    x_range=get_session_x_range(dash_df),
                 )
                 for _span, _label in ((9, "EMA 9"), (21, "EMA 21"), (50, "EMA 50")):
                     if _label in ema_choices:
