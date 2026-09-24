@@ -2957,6 +2957,73 @@ if os.path.exists(CACHE_PATH):
             render_symbol_grid(_room_df["Symbol"].tolist(), _token, key_prefix="roomcheck")
 
         st.divider()
+        st.markdown("### Pure CVD + Room Setups")
+        st.caption(
+            "Combines the room check above with a PURE (non-flipping) cumulative "
+            "volume delta: 'Sell candidates' need the support side open AND CVD "
+            "entirely red all session (never went positive). 'Buy candidates' need "
+            "the resistance side open AND CVD entirely green all session (never "
+            "went negative). Any flip either way disqualifies a stock -- mixed CVD "
+            "means conviction isn't one-directional."
+        )
+        _sell_candidates = []
+        _buy_candidates = []
+        _cvd_token = get_token()
+        for _sym in symbols_with_zones:
+            _c = cache[_sym]
+            _prev_close = _c.get("prev_close")
+            _comp_zones = _c.get("composite_zones", [])
+            if _prev_close is None or not _comp_zones:
+                continue
+            _support_side = sorted(
+                [z for z in _comp_zones if z["price_mode"] <= _prev_close],
+                key=lambda z: _prev_close - z["price_mode"],
+            )
+            _resistance_side = sorted(
+                [z for z in _comp_zones if z["price_mode"] > _prev_close],
+                key=lambda z: z["price_mode"] - _prev_close,
+            )
+            _sup_open, _ = _side_room(_prev_close, _support_side)
+            _res_open, _ = _side_room(_prev_close, _resistance_side)
+            if not (_sup_open or _res_open):
+                continue
+            _cvd_df = get_today_candles(_sym, _c["instrument_key"], _cvd_token)
+            if _cvd_df.empty:
+                continue
+            _cvd_series = compute_cumulative_volume_delta(_cvd_df)
+            _rvol = rvol_lookup.get(_sym)
+            _rvol_rounded = round(_rvol, 0) if _rvol is not None else None
+            if _sup_open and _cvd_series.max() < 0:
+                _sell_candidates.append({"Symbol": _sym, "RVOL%": _rvol_rounded})
+            if _res_open and _cvd_series.min() >= 0:
+                _buy_candidates.append({"Symbol": _sym, "RVOL%": _rvol_rounded})
+
+        _col_sell, _col_buy = st.columns(2)
+        with _col_sell:
+            st.markdown("**Sell candidates**")
+            if not _sell_candidates:
+                st.write("None right now.")
+            else:
+                _sell_df = pd.DataFrame(_sell_candidates).sort_values(
+                    "RVOL%", ascending=False, na_position="last"
+                ).reset_index(drop=True)
+                st.dataframe(_sell_df, use_container_width=True, hide_index=True)
+        with _col_buy:
+            st.markdown("**Buy candidates**")
+            if not _buy_candidates:
+                st.write("None right now.")
+            else:
+                _buy_df = pd.DataFrame(_buy_candidates).sort_values(
+                    "RVOL%", ascending=False, na_position="last"
+                ).reset_index(drop=True)
+                st.dataframe(_buy_df, use_container_width=True, hide_index=True)
+
+        _cvd_room_symbols = [r["Symbol"] for r in _sell_candidates] + [r["Symbol"] for r in _buy_candidates]
+        if _cvd_room_symbols:
+            st.divider()
+            render_symbol_grid(_cvd_room_symbols, _cvd_token, key_prefix="cvdroom")
+
+        st.divider()
         st.markdown("### Testing Support Floor")
         _floor_threshold_pct = st.slider(
             "Flag when price is within this % of the support zone's bottom edge",
