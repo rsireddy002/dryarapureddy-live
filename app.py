@@ -999,6 +999,16 @@ def run_precompute(token, progress_callback=None):
             intraday_df = fetch_candles(key, token, "minutes", "5", COMPOSITE_LOOKBACK_DAYS)
 
             prev_close = float(daily_df["close"].iloc[-1]) if not daily_df.empty else None
+            # Upstox's daily candle API can lag a day behind (may not
+            # include today's candle even after market close), while
+            # the intraday API doesn't have that lag -- fall back to
+            # today's last intraday close so Precompute run this
+            # evening reflects TODAY's actual close, not yesterday's.
+            if not intraday_df.empty:
+                _intraday_last_date = intraday_df["timestamp"].iloc[-1].date()
+                _daily_last_date = daily_df["timestamp"].iloc[-1].date() if not daily_df.empty else None
+                if _daily_last_date is None or _intraday_last_date > _daily_last_date:
+                    prev_close = float(intraday_df["close"].iloc[-1])
             avg_daily_volume = (float(daily_df["volume"].tail(RVOL_BASELINE_DAYS).mean())
                                  if len(daily_df) >= RVOL_BASELINE_DAYS else None)
             composite_zones = compute_composite_zones(intraday_df)
@@ -2541,8 +2551,8 @@ if os.path.exists(CACHE_PATH):
 
     st.divider()
 
-    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_range, tab_breakout, tab_zonewatch, tab_alerts = st.tabs(
-        ["Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Wide Range", "Breakout Watch", "Zone Watch", "Alerts"]
+    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_range, tab_breakout, tab_room_to_run, tab_tomorrow, tab_zonewatch, tab_alerts = st.tabs(
+        ["Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Wide Range", "Breakout Watch", "Room to Run", "Tomorrow's Levels", "Zone Watch", "Alerts"]
     )
 
     with tab_scanner:
@@ -2888,73 +2898,6 @@ if os.path.exists(CACHE_PATH):
             "rather than flagging it only after the breakout already happened."
         )
 
-        st.markdown("### Room to Run (pre-market, based on prev close)")
-        st.caption(
-            "Uses PREVIOUS CLOSE (known before market open) as the reference "
-            "point -- splits composite zones into support-side (below prev "
-            "close) and resistance-side (above). A side counts as having room "
-            "if it has no zone at all, only one zone, OR the gap to the "
-            "second-nearest zone on that side is at least 2% -- real room "
-            "once the near level is crossed. A tight cluster of levels close "
-            "together does NOT qualify even if open air exists further out, "
-            "since price has to fight through each one first."
-        )
-        _ROOM_THRESHOLD_PCT = st.slider(
-            "Minimum gap to count as room (%)", min_value=0.5, max_value=5.0,
-            value=2.0, step=0.5, key="room_threshold_pct",
-        )
-
-        def _side_room(_prev_close, _side_zones):
-            """Returns (is_open, detail_str) for one side's sorted-by-
-            distance zone list."""
-            if not _side_zones:
-                return True, "no zone this side"
-            if len(_side_zones) == 1:
-                return True, f"only zone {_side_zones[0]['price_mode']:.0f}"
-            _gap_pct = abs(_side_zones[1]["price_mode"] - _side_zones[0]["price_mode"]) / _prev_close * 100
-            _detail = f"{_side_zones[0]['price_mode']:.0f} -> {_side_zones[1]['price_mode']:.0f} gap {_gap_pct:.1f}%"
-            return _gap_pct >= _ROOM_THRESHOLD_PCT, _detail
-
-        _room_rows = []
-        for _sym in symbols_with_zones:
-            _c = cache[_sym]
-            _prev_close = _c.get("prev_close")
-            _comp_zones = _c.get("composite_zones", [])
-            if _prev_close is None or not _comp_zones:
-                continue
-            _support_side = sorted(
-                [z for z in _comp_zones if z["price_mode"] <= _prev_close],
-                key=lambda z: _prev_close - z["price_mode"],
-            )
-            _resistance_side = sorted(
-                [z for z in _comp_zones if z["price_mode"] > _prev_close],
-                key=lambda z: z["price_mode"] - _prev_close,
-            )
-            _sup_open, _sup_detail = _side_room(_prev_close, _support_side)
-            _res_open, _res_detail = _side_room(_prev_close, _resistance_side)
-            if _sup_open or _res_open:
-                _open_sides = []
-                if _sup_open:
-                    _open_sides.append(f"Support side ({_sup_detail})")
-                if _res_open:
-                    _open_sides.append(f"Resistance side ({_res_detail})")
-                _rvol = rvol_lookup.get(_sym)
-                _room_rows.append({
-                    "Symbol": _sym,
-                    "RVOL%": round(_rvol, 0) if _rvol is not None else None,
-                    "Open side(s)": "; ".join(_open_sides),
-                })
-
-        if not _room_rows:
-            st.write("No stocks meet the room threshold right now.")
-        else:
-            _room_df = pd.DataFrame(_room_rows).sort_values(
-                "RVOL%", ascending=False, na_position="last"
-            ).reset_index(drop=True)
-            st.dataframe(_room_df, use_container_width=True, hide_index=True)
-            st.divider()
-            _token = get_token()
-            render_symbol_grid(_room_df["Symbol"].tolist(), _token, key_prefix="roomcheck")
 
         st.divider()
         st.markdown("### Pure CVD + Room Setups")
@@ -2966,6 +2909,16 @@ if os.path.exists(CACHE_PATH):
             "went negative). Any flip either way disqualifies a stock -- mixed CVD "
             "means conviction isn't one-directional."
         )
+        _CVD_ROOM_THRESHOLD_PCT = 2.0
+
+        def _cvd_side_room(_prev_close, _side_zones):
+            if not _side_zones:
+                return True, "no zone this side"
+            if len(_side_zones) == 1:
+                return True, f"only zone {_side_zones[0]['price_mode']:.0f}"
+            _gap_pct = abs(_side_zones[1]["price_mode"] - _side_zones[0]["price_mode"]) / _prev_close * 100
+            return _gap_pct >= _CVD_ROOM_THRESHOLD_PCT, f"gap {_gap_pct:.1f}%"
+
         _sell_candidates = []
         _buy_candidates = []
         _cvd_token = get_token()
@@ -2983,8 +2936,8 @@ if os.path.exists(CACHE_PATH):
                 [z for z in _comp_zones if z["price_mode"] > _prev_close],
                 key=lambda z: z["price_mode"] - _prev_close,
             )
-            _sup_open, _ = _side_room(_prev_close, _support_side)
-            _res_open, _ = _side_room(_prev_close, _resistance_side)
+            _sup_open, _ = _cvd_side_room(_prev_close, _support_side)
+            _res_open, _ = _cvd_side_room(_prev_close, _resistance_side)
             if not (_sup_open or _res_open):
                 continue
             _cvd_df = get_today_candles(_sym, _c["instrument_key"], _cvd_token)
@@ -3054,6 +3007,163 @@ if os.path.exists(CACHE_PATH):
             st.divider()
             _token2 = get_token()
             render_symbol_grid(_floor_df["Symbol"].tolist(), _token2, key_prefix="floor")
+
+    with tab_room_to_run:
+        st.markdown("### Room to Run (pre-market, based on prev close)")
+        st.caption(
+            "Uses PREVIOUS CLOSE (known before market open) as the reference "
+            "point -- splits composite zones into support-side (below prev "
+            "close) and resistance-side (above). A side counts as having room "
+            "if it has no zone at all, only one zone, OR the gap to the "
+            "second-nearest zone on that side is at least 2% -- real room "
+            "once the near level is crossed. A tight cluster of levels close "
+            "together does NOT qualify even if open air exists further out, "
+            "since price has to fight through each one first."
+        )
+        _ROOM_THRESHOLD_PCT = st.slider(
+            "Minimum gap to count as room (%)", min_value=0.5, max_value=5.0,
+            value=2.0, step=0.5, key="room_threshold_pct",
+        )
+
+        def _side_room(_prev_close, _side_zones):
+            """Returns (is_open, detail_str) for one side's sorted-by-
+            distance zone list."""
+            if not _side_zones:
+                return True, "no zone this side"
+            if len(_side_zones) == 1:
+                return True, f"only zone {_side_zones[0]['price_mode']:.0f}"
+            _gap_pct = abs(_side_zones[1]["price_mode"] - _side_zones[0]["price_mode"]) / _prev_close * 100
+            _detail = f"{_side_zones[0]['price_mode']:.0f} -> {_side_zones[1]['price_mode']:.0f} gap {_gap_pct:.1f}%"
+            return _gap_pct >= _ROOM_THRESHOLD_PCT, _detail
+
+        _room_rows = []
+        for _sym in symbols_with_zones:
+            _c = cache[_sym]
+            _prev_close = _c.get("prev_close")
+            _comp_zones = _c.get("composite_zones", [])
+            if _prev_close is None or not _comp_zones:
+                continue
+            _support_side = sorted(
+                [z for z in _comp_zones if z["price_mode"] <= _prev_close],
+                key=lambda z: _prev_close - z["price_mode"],
+            )
+            _resistance_side = sorted(
+                [z for z in _comp_zones if z["price_mode"] > _prev_close],
+                key=lambda z: z["price_mode"] - _prev_close,
+            )
+            _sup_open, _sup_detail = _side_room(_prev_close, _support_side)
+            _res_open, _res_detail = _side_room(_prev_close, _resistance_side)
+            if _sup_open or _res_open:
+                _open_sides = []
+                if _sup_open:
+                    _open_sides.append(f"Support side ({_sup_detail})")
+                if _res_open:
+                    _open_sides.append(f"Resistance side ({_res_detail})")
+                _rvol = rvol_lookup.get(_sym)
+                _room_rows.append({
+                    "Symbol": _sym,
+                    "RVOL%": round(_rvol, 0) if _rvol is not None else None,
+                    "Open side(s)": "; ".join(_open_sides),
+                })
+
+        if not _room_rows:
+            st.write("No stocks meet the room threshold right now.")
+        else:
+            _room_df = pd.DataFrame(_room_rows).sort_values(
+                "RVOL%", ascending=False, na_position="last"
+            ).reset_index(drop=True)
+            st.dataframe(_room_df, use_container_width=True, hide_index=True)
+            st.divider()
+            _token = get_token()
+            render_symbol_grid(_room_df["Symbol"].tolist(), _token, key_prefix="roomcheck")
+
+    with tab_tomorrow:
+        st.caption(
+            "Preview of tomorrow's zones using TODAY's close as the reference -- ready "
+            "the moment Precompute finishes after today's close, no need to wait for "
+            "market open. Same room rule as 'Room to Run' above. Charts are "
+            "intentionally empty except for the zone lines and today's close -- "
+            "tomorrow's candles don't exist yet."
+        )
+        _tmr_threshold_pct = st.slider(
+            "Minimum gap to count as room (%)", min_value=0.5, max_value=5.0,
+            value=2.0, step=0.5, key="tomorrow_threshold_pct",
+        )
+
+        def _tmr_side_room(_prev_close, _side_zones):
+            if not _side_zones:
+                return True
+            if len(_side_zones) == 1:
+                return True
+            _gap_pct = abs(_side_zones[1]["price_mode"] - _side_zones[0]["price_mode"]) / _prev_close * 100
+            return _gap_pct >= _tmr_threshold_pct
+
+        _tmr_rows = []
+        for _sym in symbols_with_zones:
+            _c = cache[_sym]
+            _prev_close = _c.get("prev_close")
+            _comp_zones = _c.get("composite_zones", [])
+            if _prev_close is None:
+                continue
+            _support_side = sorted(
+                [z for z in _comp_zones if z["price_mode"] <= _prev_close],
+                key=lambda z: _prev_close - z["price_mode"],
+            )
+            _resistance_side = sorted(
+                [z for z in _comp_zones if z["price_mode"] > _prev_close],
+                key=lambda z: z["price_mode"] - _prev_close,
+            )
+            _sup_open = _tmr_side_room(_prev_close, _support_side)
+            _res_open = _tmr_side_room(_prev_close, _resistance_side)
+            if _sup_open or _res_open:
+                _rvol = rvol_lookup.get(_sym)
+                _tmr_rows.append({
+                    "Symbol": _sym,
+                    "RVOL%": round(_rvol, 0) if _rvol is not None else None,
+                    "Prev Close": round(_prev_close, 2),
+                })
+
+        if not _tmr_rows:
+            st.write("No stocks meet the room threshold right now.")
+        else:
+            _tmr_df = pd.DataFrame(_tmr_rows).sort_values(
+                "RVOL%", ascending=False, na_position="last"
+            ).reset_index(drop=True)
+            st.dataframe(_tmr_df, use_container_width=True, hide_index=True)
+            st.divider()
+
+            _tmr_date = now_ist().date() + timedelta(days=1)
+            _tmr_t0 = pd.Timestamp(f"{_tmr_date} 09:15:00")
+            _tmr_t1 = pd.Timestamp(f"{_tmr_date} 15:30:00")
+            _tmr_symbols = _tmr_df["Symbol"].tolist()
+
+            for _i in range(0, len(_tmr_symbols), 2):
+                _row_syms = _tmr_symbols[_i:_i + 2]
+                _cols = st.columns(len(_row_syms))
+                for _col, _sym in zip(_cols, _row_syms):
+                    with _col:
+                        _c = cache[_sym]
+                        _prev_close = _c.get("prev_close")
+                        _comp_zones = _c.get("composite_zones", [])
+                        _empty_df = pd.DataFrame({
+                            "timestamp": [_tmr_t0, _tmr_t1],
+                            "open": [_prev_close, _prev_close],
+                            "high": [_prev_close, _prev_close],
+                            "low": [_prev_close, _prev_close],
+                            "close": [_prev_close, _prev_close],
+                            "volume": [0, 0],
+                        })
+                        _tmr_fig = plot_candles_with_zones(
+                            _empty_df,
+                            composite_zones=_comp_zones,
+                            intraday_zones=[],
+                            validated_zones=[],
+                            title=f"{_sym} - Tomorrow (prev close {_prev_close:.2f})",
+                            height=260,
+                            compact=True,
+                            x_range=(_tmr_t0, _tmr_t1),
+                        )
+                        st.plotly_chart(_tmr_fig, use_container_width=True, key=f"tomorrow_chart_{_sym}")
 
     with tab_zonewatch:
         st.caption(
