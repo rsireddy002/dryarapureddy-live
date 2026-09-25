@@ -2551,9 +2551,102 @@ if os.path.exists(CACHE_PATH):
 
     st.divider()
 
-    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_range, tab_breakout, tab_room_to_run, tab_tomorrow, tab_zonewatch, tab_alerts = st.tabs(
-        ["Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Wide Range", "Breakout Watch", "Room to Run", "Tomorrow's Levels", "Zone Watch", "Alerts"]
+    _trade_mode_col1, _trade_mode_col2 = st.columns([1, 3])
+    with _trade_mode_col1:
+        st.radio(
+            "Trade mode", ["Paper", "Real"], horizontal=True, key="trade_mode_toggle",
+            help="Real places actual orders on Upstox (requires a confirm click). "
+                 "Paper is simulated, tracked by paper_trader_daemon.py.",
+        )
+    if st.session_state.get("trade_mode_toggle") == "Real":
+        st.warning("REAL trade mode is active -- Buy/Sell buttons below will place actual orders after you confirm.")
+
+    tab_dashboard, tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_range, tab_breakout, tab_room_to_run, tab_tomorrow, tab_zonewatch, tab_alerts = st.tabs(
+        ["Dashboard", "Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Wide Range", "Breakout Watch", "Room to Run", "Tomorrow's Levels", "Zone Watch", "Alerts"]
     )
+
+    with tab_dashboard:
+        st.markdown("""
+<style>
+.algolab-strip{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.algolab-card{background:#11161f;border:1px solid #232b3a;border-radius:12px;padding:12px 18px;min-width:130px}
+.algolab-card .k{color:#8fa1bd;font-size:11.5px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.algolab-card .v{font-size:19px;font-weight:700;margin-top:2px;color:#cdd6e4}
+.algolab-pos{color:#34D399} .algolab-neg{color:#F87171}
+</style>
+""", unsafe_allow_html=True)
+
+        _dash_paper_log = load_paper_trades()
+        _open_trades = [t for t in _dash_paper_log["trades"] if t["status"] == "open"]
+        _closed_trades = [t for t in _dash_paper_log["trades"] if t["status"] != "open"]
+
+        _live_pnl = 0.0
+        for _t in _open_trades:
+            _ltp = price_lookup.get(_t["symbol"])
+            if _ltp is None:
+                continue
+            if _t["direction"] == "long":
+                _t["_live_pnl"] = round((_ltp - _t["entry_price"]) * _t["qty"], 2)
+            else:
+                _t["_live_pnl"] = round((_t["entry_price"] - _ltp) * _t["qty"], 2)
+            _t["_ltp"] = _ltp
+            _live_pnl += _t["_live_pnl"]
+        _booked_pnl = sum(_t.get("pnl") or 0 for _t in _closed_trades)
+        _total_pnl = _live_pnl + _booked_pnl
+
+        def _pnl_class(v):
+            return "algolab-pos" if v > 0 else ("algolab-neg" if v < 0 else "")
+
+        def _rupee(v):
+            return f"{'-' if v < 0 else ''}\u20b9{abs(v):,.0f}"
+
+        st.markdown(
+            f'<div class="algolab-strip">'
+            f'<div class="algolab-card"><div class="k">Open trades</div><div class="v">{len(_open_trades)}</div></div>'
+            f'<div class="algolab-card"><div class="k">Closed</div><div class="v">{len(_closed_trades)}</div></div>'
+            f'<div class="algolab-card"><div class="k">Live PnL</div><div class="v {_pnl_class(_live_pnl)}">{_rupee(_live_pnl)}</div></div>'
+            f'<div class="algolab-card"><div class="k">Booked PnL</div><div class="v {_pnl_class(_booked_pnl)}">{_rupee(_booked_pnl)}</div></div>'
+            f'<div class="algolab-card"><div class="k">Total PnL</div><div class="v {_pnl_class(_total_pnl)}">{_rupee(_total_pnl)}</div></div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.caption(
+            "Paper trades only -- tracked continuously by paper_trader_daemon.py, "
+            "which runs independently of this browser tab, so positions persist "
+            "even after closing the terminal. Real orders are logged separately "
+            "in real_orders_log.json; there's no Upstox positions API wired in "
+            "yet for live real-order PnL, so check Upstox's own console for that."
+        )
+
+        if not _dash_paper_log["trades"]:
+            st.info("No paper trades yet today.")
+        else:
+            _dash_rows = []
+            for _t in sorted(_dash_paper_log["trades"], key=lambda x: 0 if x["status"] == "open" else 1):
+                _dash_rows.append({
+                    "Symbol": _t["symbol"],
+                    "Direction": _t["direction"].upper(),
+                    "Entry": _t["entry_price"],
+                    "SL": _t["stop_loss"],
+                    "Target": _t["target"],
+                    "Qty": _t["qty"],
+                    "LTP": _t.get("_ltp", _t.get("exit_price")),
+                    "PnL": _t.get("_live_pnl", _t.get("pnl")),
+                    "Status": _t["status"].upper() if _t["status"] == "open" else (_t.get("exit_reason") or _t["status"]).upper(),
+                    "Source": _t.get("source", "manual"),
+                })
+            _dash_df = pd.DataFrame(_dash_rows)
+
+            def _style_pnl(v):
+                if v is None:
+                    return ""
+                return "color: #1a7a4c" if v > 0 else ("color: #b3261e" if v < 0 else "")
+
+            st.dataframe(
+                _dash_df.style.map(_style_pnl, subset=["PnL"]),
+                use_container_width=True, hide_index=True,
+            )
 
     with tab_scanner:
         st.caption(f"Last refreshed: {st.session_state.get('last_refresh_time', 'never')}")
@@ -2780,35 +2873,94 @@ if os.path.exists(CACHE_PATH):
 
                             long_c = build_manual_trade_candidate("long", sym, val_comp, grid_df)
                             short_c = build_manual_trade_candidate("short", sym, val_comp, grid_df)
+                            _trade_mode = st.session_state.get("trade_mode_toggle", "Paper")
                             bcol, scol = st.columns(2)
                             with bcol:
                                 if long_c is not None:
-                                    tgt = f"{long_c['target']:.1f}" if long_c['target'] is not None else "open"
-                                    st.caption(f"SL {long_c['stop_loss']:.1f} / T {tgt}")
-                                    if st.button("Buy", key=f"{key_prefix}_buy_{sym}"):
-                                        grid_paper_log = load_paper_trades()
-                                        if has_open_paper_trade(grid_paper_log, sym):
-                                            st.warning(f"Already open in {sym}.")
-                                        elif open_paper_trade(grid_paper_log, long_c):
-                                            save_paper_trades(grid_paper_log)
-                                            st.session_state["paper_log"] = grid_paper_log
-                                            st.success(f"LONG opened: {sym}")
+                                    _long_sl = st.number_input(
+                                        "SL", value=float(long_c["stop_loss"]), step=0.05, format="%.2f",
+                                        key=f"{key_prefix}_longsl_{sym}",
+                                    )
+                                    _long_tgt_default = float(long_c["target"]) if long_c["target"] is not None else float(long_c["entry_price"]) * 1.01
+                                    _long_tgt = st.number_input(
+                                        "Target", value=_long_tgt_default, step=0.05, format="%.2f",
+                                        key=f"{key_prefix}_longtgt_{sym}",
+                                    )
+                                    _long_c_edited = dict(long_c)
+                                    _long_c_edited["stop_loss"] = _long_sl
+                                    _long_c_edited["target"] = _long_tgt
+                                    _buy_pending_key = f"pending_real_{key_prefix}_buy_{sym}"
+                                    if _trade_mode == "Real":
+                                        if st.session_state.get(_buy_pending_key):
+                                            if st.button("Confirm BUY (real)", key=f"{key_prefix}_buyconfirm_{sym}"):
+                                                _ok, _msg, _order_ids = place_real_market_order(
+                                                    c["instrument_key"], long_c["qty"], "BUY", token,
+                                                )
+                                                st.session_state[_buy_pending_key] = False
+                                                if _ok:
+                                                    log_real_order(sym, "BUY", long_c["qty"], _order_ids, c["instrument_key"])
+                                                    st.success(f"{_msg} (your SL {_long_sl:.2f} / Target {_long_tgt:.2f} -- market order only, not auto-placed)")
+                                                else:
+                                                    st.error(_msg)
+                                            if st.button("Cancel", key=f"{key_prefix}_buycancel_{sym}"):
+                                                st.session_state[_buy_pending_key] = False
                                         else:
-                                            st.warning("Qty rounds to 0 -- not opened.")
+                                            if st.button("Buy (REAL)", key=f"{key_prefix}_buy_{sym}"):
+                                                st.session_state[_buy_pending_key] = True
+                                    else:
+                                        if st.button("Buy", key=f"{key_prefix}_buy_{sym}"):
+                                            grid_paper_log = load_paper_trades()
+                                            if has_open_paper_trade(grid_paper_log, sym):
+                                                st.warning(f"Already open in {sym}.")
+                                            elif open_paper_trade(grid_paper_log, _long_c_edited):
+                                                save_paper_trades(grid_paper_log)
+                                                st.session_state["paper_log"] = grid_paper_log
+                                                st.success(f"LONG opened: {sym}")
+                                            else:
+                                                st.warning("Qty rounds to 0 -- not opened.")
                             with scol:
                                 if short_c is not None:
-                                    tgt = f"{short_c['target']:.1f}" if short_c['target'] is not None else "open"
-                                    st.caption(f"SL {short_c['stop_loss']:.1f} / T {tgt}")
-                                    if st.button("Sell", key=f"{key_prefix}_sell_{sym}"):
-                                        grid_paper_log = load_paper_trades()
-                                        if has_open_paper_trade(grid_paper_log, sym):
-                                            st.warning(f"Already open in {sym}.")
-                                        elif open_paper_trade(grid_paper_log, short_c):
-                                            save_paper_trades(grid_paper_log)
-                                            st.session_state["paper_log"] = grid_paper_log
-                                            st.success(f"SHORT opened: {sym}")
+                                    _short_sl = st.number_input(
+                                        "SL", value=float(short_c["stop_loss"]), step=0.05, format="%.2f",
+                                        key=f"{key_prefix}_shortsl_{sym}",
+                                    )
+                                    _short_tgt_default = float(short_c["target"]) if short_c["target"] is not None else float(short_c["entry_price"]) * 0.99
+                                    _short_tgt = st.number_input(
+                                        "Target", value=_short_tgt_default, step=0.05, format="%.2f",
+                                        key=f"{key_prefix}_shorttgt_{sym}",
+                                    )
+                                    _short_c_edited = dict(short_c)
+                                    _short_c_edited["stop_loss"] = _short_sl
+                                    _short_c_edited["target"] = _short_tgt
+                                    _sell_pending_key = f"pending_real_{key_prefix}_sell_{sym}"
+                                    if _trade_mode == "Real":
+                                        if st.session_state.get(_sell_pending_key):
+                                            if st.button("Confirm SELL (real)", key=f"{key_prefix}_sellconfirm_{sym}"):
+                                                _ok, _msg, _order_ids = place_real_market_order(
+                                                    c["instrument_key"], short_c["qty"], "SELL", token,
+                                                )
+                                                st.session_state[_sell_pending_key] = False
+                                                if _ok:
+                                                    log_real_order(sym, "SELL", short_c["qty"], _order_ids, c["instrument_key"])
+                                                    st.success(f"{_msg} (your SL {_short_sl:.2f} / Target {_short_tgt:.2f} -- market order only, not auto-placed)")
+                                                else:
+                                                    st.error(_msg)
+                                            if st.button("Cancel", key=f"{key_prefix}_sellcancel_{sym}"):
+                                                st.session_state[_sell_pending_key] = False
                                         else:
-                                            st.warning("Qty rounds to 0 -- not opened.")
+                                            if st.button("Sell (REAL)", key=f"{key_prefix}_sell_{sym}"):
+                                                st.session_state[_sell_pending_key] = True
+                                    else:
+                                        if st.button("Sell", key=f"{key_prefix}_sell_{sym}"):
+                                            grid_paper_log = load_paper_trades()
+                                            if has_open_paper_trade(grid_paper_log, sym):
+                                                st.warning(f"Already open in {sym}.")
+                                            elif open_paper_trade(grid_paper_log, _short_c_edited):
+                                                save_paper_trades(grid_paper_log)
+                                                st.session_state["paper_log"] = grid_paper_log
+                                                st.success(f"SHORT opened: {sym}")
+                                            else:
+                                                st.warning("Qty rounds to 0 -- not opened.")
 
             if view_mode == "One sector at a time":
                 selected_sector = st.selectbox("Sector", available_sectors, key="sector_select")
