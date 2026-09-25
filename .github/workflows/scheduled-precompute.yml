@@ -1,5 +1,8 @@
 name: Scheduled Precompute
 
+permissions:
+  contents: write
+
 on:
   schedule:
     # 10:35 UTC = 4:05 PM IST, shortly after market close (3:30 PM IST)
