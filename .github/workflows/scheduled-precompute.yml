@@ -1,0 +1,35 @@
+name: Scheduled Precompute
+
+on:
+  schedule:
+    # 10:35 UTC = 4:05 PM IST, shortly after market close (3:30 PM IST)
+    - cron: "35 10 * * 1-5"
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab too
+
+jobs:
+  precompute:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas
+
+      - name: Run precompute
+        env:
+          UPSTOX_ANALYTICAL_TOKEN: ${{ secrets.UPSTOX_ANALYTICAL_TOKEN }}
+        run: python github_precompute.py
+
+      - name: Commit and push updated cache
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sahi_zones_cache.json
+          git diff --quiet --cached || git commit -m "Scheduled precompute: $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
